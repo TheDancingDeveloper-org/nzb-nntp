@@ -171,7 +171,10 @@ mod tests {
         assert_eq!(deserialized.connections, 8);
         assert_eq!(deserialized.retention, 3000);
         assert!(deserialized.compress);
-        assert_eq!(deserialized.proxy_url, Some("socks5://proxy:1080".to_string()));
+        assert_eq!(
+            deserialized.proxy_url,
+            Some("socks5://proxy:1080".to_string())
+        );
     }
 
     #[test]

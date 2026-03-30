@@ -251,7 +251,12 @@ impl NntpConnection {
         debug!(server = %self.server_id, %addr, ssl = config.ssl, "Connecting");
 
         // 1. TCP connect (optionally through SOCKS5 proxy)
-        let tcp = if let Some(proxy_url) = config.proxy_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        let tcp = if let Some(proxy_url) = config
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             let proxy = parse_socks5_url(proxy_url).map_err(|e| {
                 self.state = ConnectionState::Error;
                 NntpError::Connection(format!("Invalid proxy URL: {e}"))
@@ -949,10 +954,7 @@ impl NntpConnection {
     /// Response code 215 means list follows (dot-terminated).
     ///
     /// Optionally pass a wildmat pattern to filter groups (e.g., "alt.binaries.*").
-    pub async fn list_active(
-        &mut self,
-        wildmat: Option<&str>,
-    ) -> NntpResult<Vec<ListActiveEntry>> {
+    pub async fn list_active(&mut self, wildmat: Option<&str>) -> NntpResult<Vec<ListActiveEntry>> {
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
                 "Cannot LIST ACTIVE in state {:?}",
@@ -1046,10 +1048,7 @@ impl NntpConnection {
                 }
 
                 // Send termination line
-                transport
-                    .write_all(b".\r\n")
-                    .await
-                    .map_err(NntpError::Io)?;
+                transport.write_all(b".\r\n").await.map_err(NntpError::Io)?;
 
                 // Read final response
                 let result = self.read_response_line().await?;
@@ -2374,7 +2373,10 @@ mod tests {
     async fn test_article_with_dot_stuffed_body() {
         let mut articles = HashMap::new();
         // Body with lines starting with dots — mock server will dot-stuff them
-        articles.insert("dot@test".into(), b"Line one\n.This starts with dot\n..Two dots\nEnd".to_vec());
+        articles.insert(
+            "dot@test".into(),
+            b"Line one\n.This starts with dot\n..Two dots\nEnd".to_vec(),
+        );
 
         let server = MockNntpServer::start(MockConfig {
             articles,
@@ -2522,9 +2524,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_active_with_wildmat() {
-        let list_active_entries = vec![
-            "alt.binaries.test 1000 1 y".into(),
-        ];
+        let list_active_entries = vec!["alt.binaries.test 1000 1 y".into()];
 
         let server = MockNntpServer::start(MockConfig {
             list_active_entries,
@@ -2675,9 +2675,7 @@ mod tests {
         let mut articles = HashMap::new();
         articles.insert("a1@test".into(), b"Article one body".to_vec());
 
-        let xover_entries = vec![
-            "1\tSubject\tposter@x\tDate\t<a1@test>\t\t1000\t20".into(),
-        ];
+        let xover_entries = vec!["1\tSubject\tposter@x\tDate\t<a1@test>\t\t1000\t20".into()];
 
         let server = MockNntpServer::start(MockConfig {
             groups,
