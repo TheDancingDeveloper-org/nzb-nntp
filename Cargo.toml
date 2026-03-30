@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Async NNTP client with TLS, pipelining, connection pooling, and multi-server support"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith/nzb-nntp"
+repository = "https://github.com/AusAgentSmith-org/nzb-nntp"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
