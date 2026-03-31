@@ -48,7 +48,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            id: String::new(),
+            id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
             host: String::new(),
             port: 563,
@@ -56,11 +56,11 @@ impl Default for ServerConfig {
             ssl_verify: true,
             username: None,
             password: None,
-            connections: 4,
+            connections: 8,
             priority: 0,
             enabled: true,
             retention: 0,
-            pipelining: 20,
+            pipelining: 1,
             optional: false,
             compress: false,
             ramp_up_delay_ms: 250,
@@ -154,7 +154,7 @@ mod tests {
             priority: 0,
             enabled: true,
             retention: 3000,
-            pipelining: 20,
+            pipelining: 1,
             optional: false,
             compress: true,
             ramp_up_delay_ms: 500,
@@ -180,14 +180,17 @@ mod tests {
     #[test]
     fn test_server_config_defaults() {
         let config = ServerConfig::default();
+        // ID should be a valid UUID (not empty)
+        assert!(!config.id.is_empty());
+        assert!(uuid::Uuid::parse_str(&config.id).is_ok());
         assert_eq!(config.port, 563);
         assert!(config.ssl);
         assert!(config.ssl_verify);
-        assert_eq!(config.connections, 4);
+        assert_eq!(config.connections, 8);
         assert_eq!(config.priority, 0);
         assert!(config.enabled);
         assert_eq!(config.retention, 0);
-        assert_eq!(config.pipelining, 20);
+        assert_eq!(config.pipelining, 1);
         assert!(!config.optional);
         assert!(!config.compress);
         assert_eq!(config.ramp_up_delay_ms, 250);
