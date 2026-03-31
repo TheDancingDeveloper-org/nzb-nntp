@@ -27,6 +27,8 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 serde_json = "1"
 toml = "0.8"
+dotenvy = "0.15"
+rustls = { version = "0.23", features = ["ring"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
