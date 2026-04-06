@@ -1,6 +1,6 @@
 [package]
 name = "nzb-nntp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Async NNTP client with TLS, pipelining, connection pooling, and multi-server support"
 license = "MIT"
