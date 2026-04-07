@@ -330,10 +330,7 @@ impl Downloader {
             host = %config.host,
             "Downloader: fresh connection ready"
         );
-        Ok(PooledConnection {
-            conn,
-            last_used: std::time::Instant::now(),
-        })
+        Ok(PooledConnection::unmanaged(conn))
     }
 }
 

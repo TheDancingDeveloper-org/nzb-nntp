@@ -27,11 +27,40 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 // ---------------------------------------------------------------------------
 
 /// A connection checked out from the pool, with metadata.
+///
+/// When dropped without being returned via `release()` or `discard()`, the
+/// semaphore permit is automatically freed so the pool slot is not leaked.
 pub struct PooledConnection {
     /// The underlying NNTP connection.
     pub conn: NntpConnection,
     /// When this connection last completed an operation.
     pub last_used: Instant,
+    /// Semaphore reference for automatic permit release on drop.
+    semaphore: Option<Arc<Semaphore>>,
+}
+
+impl PooledConnection {
+    /// Create a new pooled connection not tied to any pool's semaphore.
+    /// Used by the downloader which manages its own connection lifecycle.
+    pub fn unmanaged(conn: NntpConnection) -> Self {
+        Self {
+            conn,
+            last_used: Instant::now(),
+            semaphore: None,
+        }
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(sem) = self.semaphore.take() {
+            warn!(
+                conn_id = %self.conn.server_id,
+                "PooledConnection dropped without release/discard — freeing permit"
+            );
+            sem.add_permits(1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +150,9 @@ impl ConnectionPool {
         let maybe_idle = { self.idle.lock().pop() };
 
         if let Some(mut pooled) = maybe_idle {
+            // Arm the drop guard so the permit is freed if this connection
+            // is dropped without release/discard.
+            pooled.semaphore = Some(Arc::clone(&self.semaphore));
             // Health check: if the connection is in a bad state, discard and make new
             if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
                 // If idle too long, do a quick liveness check
@@ -187,6 +219,7 @@ impl ConnectionPool {
         Ok(PooledConnection {
             conn,
             last_used: Instant::now(),
+            semaphore: Some(Arc::clone(&self.semaphore)),
         })
     }
 
@@ -195,6 +228,8 @@ impl ConnectionPool {
     /// If the connection is still healthy it goes back to the idle list.
     /// If it is in an error state it is dropped and the slot is freed.
     pub fn release(&self, mut pooled: PooledConnection) {
+        // Disarm the drop guard — we're handling the permit ourselves.
+        pooled.semaphore = None;
         if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
             pooled.last_used = Instant::now();
             let idle_after = {
@@ -202,6 +237,8 @@ impl ConnectionPool {
                 idle.push(pooled);
                 idle.len()
             };
+            // Restore the semaphore permit so the next acquire() can proceed.
+            self.semaphore.add_permits(1);
             debug!(
                 server = %self.config.name,
                 idle_count = idle_after,
@@ -222,7 +259,9 @@ impl ConnectionPool {
     }
 
     /// Discard a connection (e.g. after a fatal error) and free the slot.
-    pub fn discard(&self, pooled: PooledConnection) {
+    pub fn discard(&self, mut pooled: PooledConnection) {
+        // Disarm the drop guard — we'll add the permit back explicitly.
+        pooled.semaphore = None;
         info!(
             server = %self.config.name,
             conn_id = %pooled.conn.server_id,
