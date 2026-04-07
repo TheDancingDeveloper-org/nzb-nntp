@@ -1275,6 +1275,7 @@ impl NntpConnection {
     /// Read a multi-line body terminated by `.\r\n`. Un-does dot-stuffing.
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
+        let read_start = std::time::Instant::now();
         let transport = self
             .transport
             .as_mut()
@@ -1282,6 +1283,7 @@ impl NntpConnection {
 
         let mut body = Vec::with_capacity(1024 * 1024);
         let mut line_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+        let mut line_count: u32 = 0;
 
         loop {
             line_buf.clear();
@@ -1296,6 +1298,8 @@ impl NntpConnection {
                 ));
             }
 
+            line_count += 1;
+
             // Check for termination: a lone dot followed by CRLF
             if line_buf == b".\r\n" || line_buf == b".\n" {
                 break;
@@ -1308,6 +1312,15 @@ impl NntpConnection {
                 body.extend_from_slice(&line_buf);
             }
         }
+
+        let read_us = read_start.elapsed().as_micros();
+        tracing::trace!(
+            server = %self.server_id,
+            body_bytes = body.len(),
+            line_count,
+            read_us,
+            "Body read complete"
+        );
 
         Ok(body)
     }
@@ -1478,18 +1491,26 @@ fn parse_socks5_url(url: &str) -> Result<Socks5Proxy, String> {
 }
 
 /// Build a `rustls::ClientConfig` for NNTP TLS connections.
+///
+/// Uses the `ring` crypto provider explicitly so callers don't need to install
+/// a process-level default via `CryptoProvider::install_default()`.
 fn build_tls_config(verify_certs: bool) -> NntpResult<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     if verify_certs {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = rustls::ClientConfig::builder()
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| NntpError::Connection(format!("TLS config error: {e}")))?
             .with_root_certificates(root_store)
             .with_no_client_auth();
         Ok(config)
     } else {
         // Dangerous: skip certificate verification (user opted out)
-        let config = rustls::ClientConfig::builder()
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| NntpError::Connection(format!("TLS config error: {e}")))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth();
@@ -1532,7 +1553,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
