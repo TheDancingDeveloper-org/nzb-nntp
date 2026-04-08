@@ -1236,6 +1236,13 @@ impl NntpConnection {
 
     /// Send a raw NNTP command followed by `\r\n`. Does not read the response.
     pub(crate) async fn send_command(&mut self, cmd: &str) -> NntpResult<()> {
+        self.send_command_no_flush(cmd).await?;
+        self.flush().await
+    }
+
+    /// Write a command WITHOUT flushing the TCP buffer.
+    /// Used by the pipeline to batch multiple ARTICLE commands before a single flush.
+    pub(crate) async fn send_command_no_flush(&mut self, cmd: &str) -> NntpResult<()> {
         let transport = self
             .transport
             .as_mut()
@@ -1245,10 +1252,25 @@ impl NntpConnection {
 
         let mut line = cmd.to_string();
         line.push_str("\r\n");
-        transport
-            .write_all(line.as_bytes())
-            .await
-            .map_err(NntpError::Io)?;
+        match transport {
+            Transport::Plain(r) => r.get_mut().write_all(line.as_bytes()).await,
+            Transport::Tls(r) => r.get_mut().write_all(line.as_bytes()).await,
+        }
+        .map_err(NntpError::Io)?;
+        Ok(())
+    }
+
+    /// Flush the TCP write buffer.
+    pub(crate) async fn flush(&mut self) -> NntpResult<()> {
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(NntpError::Connection("Not connected".into()))?;
+        match transport {
+            Transport::Plain(r) => r.get_mut().flush().await,
+            Transport::Tls(r) => r.get_mut().flush().await,
+        }
+        .map_err(NntpError::Io)?;
         Ok(())
     }
 

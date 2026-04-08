@@ -89,7 +89,10 @@ impl Pipeline {
     /// Send as many pending requests as the pipeline depth allows.
     ///
     /// This only sends the ARTICLE commands; it does NOT read any responses.
+    /// All commands are buffered first, then flushed once — this is critical
+    /// for pipelining performance (avoids per-command TCP flushes).
     pub async fn flush_sends(&mut self, conn: &mut NntpConnection) -> NntpResult<()> {
+        let mut sent = 0usize;
         while self.in_flight.len() < self.depth {
             let Some(req) = self.pending.pop_front() else {
                 break;
@@ -101,9 +104,14 @@ impl Pipeline {
                 format!("<{}>", req.message_id)
             };
 
-            conn.send_command(&format!("ARTICLE {mid}")).await?;
+            conn.send_command_no_flush(&format!("ARTICLE {mid}"))
+                .await?;
             trace!(mid = %mid, tag = req.tag, "Pipeline sent ARTICLE");
             self.in_flight.push_back(req);
+            sent += 1;
+        }
+        if sent > 0 {
+            conn.flush().await?;
         }
         Ok(())
     }
@@ -277,16 +285,18 @@ impl StatPipeline {
             // Set connection to Busy for the duration of this batch
             conn.state = ConnectionState::Busy;
 
-            // Send all STAT commands in this batch
+            // Send all STAT commands in this batch (buffered, single flush)
             for mid in batch {
                 let normalized = if mid.starts_with('<') && mid.ends_with('>') {
                     mid.clone()
                 } else {
                     format!("<{mid}>")
                 };
-                conn.send_command(&format!("STAT {normalized}")).await?;
+                conn.send_command_no_flush(&format!("STAT {normalized}"))
+                    .await?;
                 trace!(mid = %normalized, "StatPipeline sent STAT");
             }
+            conn.flush().await?;
 
             // Read responses in order
             for mid in batch {
