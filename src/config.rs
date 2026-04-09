@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// NNTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Unique server identifier
     pub id: String,
