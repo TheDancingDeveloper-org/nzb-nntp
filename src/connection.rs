@@ -1309,7 +1309,10 @@ impl NntpConnection {
                 );
                 NntpError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("read_response_line timed out after {}s", READ_LINE_TIMEOUT.as_secs()),
+                    format!(
+                        "read_response_line timed out after {}s",
+                        READ_LINE_TIMEOUT.as_secs()
+                    ),
                 ))
             })?
             .map_err(NntpError::Io)?;
