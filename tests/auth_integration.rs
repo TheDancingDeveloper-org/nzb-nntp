@@ -41,26 +41,15 @@ fn env(key: &str) -> Option<String> {
 
 /// Build a `ServerConfig` for a given host/port/user/pass.
 fn make_config(name: &str, host: &str, port: u16, user: &str, pass: &str) -> ServerConfig {
-    ServerConfig {
-        id: name.to_string(),
-        name: name.to_string(),
-        host: host.to_string(),
-        port,
-        ssl: true,
-        ssl_verify: true,
-        username: Some(user.to_string()),
-        password: Some(pass.to_string()),
-        connections: 1,
-        priority: 0,
-        enabled: true,
-        retention: 0,
-        pipelining: 1,
-        optional: false,
-        compress: false,
-        ramp_up_delay_ms: 0,
-        recv_buffer_size: 0,
-        proxy_url: None,
-    }
+    let mut config = ServerConfig::new(name, host);
+    config.name = name.to_string();
+    config.port = port;
+    config.username = Some(user.to_string());
+    config.password = Some(pass.to_string());
+    config.connections = 1;
+    config.ramp_up_delay_ms = 0;
+    config.recv_buffer_size = 0;
+    config
 }
 
 /// Connect + authenticate, then QUIT. Returns the welcome message on success.
