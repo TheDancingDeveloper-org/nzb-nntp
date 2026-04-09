@@ -58,6 +58,7 @@ fn make_config(name: &str, host: &str, port: u16, user: &str, pass: &str) -> Ser
         optional: false,
         compress: false,
         ramp_up_delay_ms: 0,
+        recv_buffer_size: 0,
         proxy_url: None,
     }
 }

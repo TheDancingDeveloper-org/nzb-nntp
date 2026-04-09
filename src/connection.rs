@@ -293,6 +293,12 @@ impl NntpConnection {
             })?
         };
         tcp.set_nodelay(true).ok();
+        if config.recv_buffer_size > 0 {
+            let sock = socket2::SockRef::from(&tcp);
+            if let Err(e) = sock.set_recv_buffer_size(config.recv_buffer_size as usize) {
+                warn!(server = %self.server_id, size = config.recv_buffer_size, "failed to set SO_RCVBUF: {e}");
+            }
+        }
         info!(server = %self.server_id, %addr, "TCP connected");
 
         // 2. Optional TLS
@@ -1297,7 +1303,6 @@ impl NntpConnection {
     /// Read a multi-line body terminated by `.\r\n`. Un-does dot-stuffing.
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
-        let read_start = std::time::Instant::now();
         let transport = self
             .transport
             .as_mut()
@@ -1305,7 +1310,6 @@ impl NntpConnection {
 
         let mut body = Vec::with_capacity(1024 * 1024);
         let mut line_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
-        let mut line_count: u32 = 0;
 
         loop {
             line_buf.clear();
@@ -1320,8 +1324,6 @@ impl NntpConnection {
                 ));
             }
 
-            line_count += 1;
-
             // Check for termination: a lone dot followed by CRLF
             if line_buf == b".\r\n" || line_buf == b".\n" {
                 break;
@@ -1334,15 +1336,6 @@ impl NntpConnection {
                 body.extend_from_slice(&line_buf);
             }
         }
-
-        let read_us = read_start.elapsed().as_micros();
-        tracing::trace!(
-            server = %self.server_id,
-            body_bytes = body.len(),
-            line_count,
-            read_us,
-            "Body read complete"
-        );
 
         Ok(body)
     }

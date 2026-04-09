@@ -132,6 +132,7 @@ pub fn test_config(port: u16) -> ServerConfig {
         optional: false,
         compress: false,
         ramp_up_delay_ms: 0, // no delay in tests
+        recv_buffer_size: 0,
         proxy_url: None,
     }
 }

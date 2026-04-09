@@ -40,9 +40,17 @@ pub struct ServerConfig {
     /// Prevents connection bursts that trigger server-side rate limiting.
     #[serde(default)]
     pub ramp_up_delay_ms: u32,
+    /// TCP receive buffer size in bytes (SO_RCVBUF). 0 = OS default.
+    #[serde(default = "default_recv_buffer_size")]
+    pub recv_buffer_size: u32,
     /// Optional SOCKS5 proxy URL: `socks5://[username:password@]host:port`
     #[serde(default)]
     pub proxy_url: Option<String>,
+}
+
+/// Default TCP receive buffer: 2 MiB.
+fn default_recv_buffer_size() -> u32 {
+    2 * 1024 * 1024
 }
 
 impl Default for ServerConfig {
@@ -64,6 +72,7 @@ impl Default for ServerConfig {
             optional: false,
             compress: false,
             ramp_up_delay_ms: 250,
+            recv_buffer_size: default_recv_buffer_size(),
             proxy_url: None,
         }
     }
@@ -158,6 +167,7 @@ mod tests {
             optional: false,
             compress: true,
             ramp_up_delay_ms: 500,
+            recv_buffer_size: 2 * 1024 * 1024,
             proxy_url: Some("socks5://proxy:1080".to_string()),
         };
 
