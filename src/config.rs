@@ -54,6 +54,17 @@ fn default_recv_buffer_size() -> u32 {
     2 * 1024 * 1024
 }
 
+impl ServerConfig {
+    /// Create a new `ServerConfig` with the given id and host, using defaults for all other fields.
+    pub fn new(id: impl Into<String>, host: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            host: host.into(),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
