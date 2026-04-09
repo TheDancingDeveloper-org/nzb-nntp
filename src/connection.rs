@@ -10,12 +10,23 @@
 //! 5. QUIT -> close
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_socks::tcp::Socks5Stream;
 use tracing::{debug, info, trace, warn};
+
+/// Timeout for reading a single response line from the server.
+/// If the server doesn't respond within this window, the connection is
+/// considered dead and an I/O error is returned so workers can reconnect.
+const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for reading each line of a multi-line body (article data).
+/// This is per-line, not per-article — large articles get many lines but
+/// each individual line read must complete within this window.
+const READ_BODY_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 
 use crate::config::{ListActiveEntry, ServerConfig};
 
@@ -1288,9 +1299,19 @@ impl NntpConnection {
             .ok_or(NntpError::Connection("Not connected".into()))?;
 
         let mut line = String::with_capacity(256);
-        let n = transport
-            .read_line(&mut line)
+        let n = tokio::time::timeout(READ_LINE_TIMEOUT, transport.read_line(&mut line))
             .await
+            .map_err(|_| {
+                warn!(
+                    server = %self.server_id,
+                    "read_response_line timed out after {}s — connection likely dead",
+                    READ_LINE_TIMEOUT.as_secs()
+                );
+                NntpError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("read_response_line timed out after {}s", READ_LINE_TIMEOUT.as_secs()),
+                ))
+            })?
             .map_err(NntpError::Io)?;
 
         if n == 0 {
@@ -1313,10 +1334,28 @@ impl NntpConnection {
 
         loop {
             line_buf.clear();
-            let n = transport
-                .read_line_bytes(&mut line_buf)
-                .await
-                .map_err(NntpError::Io)?;
+            let n = tokio::time::timeout(
+                READ_BODY_LINE_TIMEOUT,
+                transport.read_line_bytes(&mut line_buf),
+            )
+            .await
+            .map_err(|_| {
+                warn!(
+                    server = %self.server_id,
+                    body_bytes = body.len(),
+                    "read_multiline_body timed out after {}s — connection likely dead",
+                    READ_BODY_LINE_TIMEOUT.as_secs()
+                );
+                NntpError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "read_multiline_body timed out after {}s (received {} bytes so far)",
+                        READ_BODY_LINE_TIMEOUT.as_secs(),
+                        body.len()
+                    ),
+                ))
+            })?
+            .map_err(NntpError::Io)?;
 
             if n == 0 {
                 return Err(NntpError::Connection(
