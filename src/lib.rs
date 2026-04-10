@@ -18,8 +18,9 @@ pub mod pipeline;
 pub mod pool;
 pub mod server;
 
-#[cfg(test)]
-pub(crate) mod testutil;
+/// Test utilities: in-process mock NNTP server. Only available with the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testutil;
 
 pub use config::{Article, ListActiveEntry, ServerConfig};
 pub use connection::{
