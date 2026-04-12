@@ -10,7 +10,7 @@
 //! 5. QUIT -> close
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -257,6 +257,7 @@ impl NntpConnection {
     /// banner, and authenticates if credentials are configured.
     pub async fn connect(&mut self, config: &ServerConfig) -> NntpResult<()> {
         self.state = ConnectionState::Connecting;
+        let t_connect = Instant::now();
 
         let addr = format!("{}:{}", config.host, config.port);
         info!(
@@ -387,7 +388,12 @@ impl NntpConnection {
             debug!(server = %self.server_id, error = %e, "Compression negotiation failed, continuing without");
         }
 
-        debug!(server = %self.server_id, compress = self.compress_enabled, "Connection ready");
+        info!(
+            server = %self.server_id,
+            compress = self.compress_enabled,
+            connect_ms = t_connect.elapsed().as_millis() as u64,
+            "nntp_connect"
+        );
         Ok(())
     }
 
@@ -852,6 +858,7 @@ impl NntpConnection {
             )));
         }
         self.state = ConnectionState::Busy;
+        let t_xover = Instant::now();
 
         self.send_command(&format!("XOVER {start}-{end}")).await?;
         let status = self.read_response_line().await?;
@@ -860,7 +867,18 @@ impl NntpConnection {
             224 => {
                 let data = self.read_multiline_body_maybe_decompress().await?;
                 self.state = ConnectionState::Ready;
-                Ok(parse_xover_data(&data))
+                let entries = parse_xover_data(&data);
+                debug!(
+                    server = %self.server_id,
+                    start,
+                    end,
+                    range = end.saturating_sub(start) + 1,
+                    articles = entries.len(),
+                    bytes = data.len(),
+                    xover_ms = t_xover.elapsed().as_millis() as u64,
+                    "nntp_xover"
+                );
+                Ok(entries)
             }
             420 => {
                 self.state = ConnectionState::Ready;
