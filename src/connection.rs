@@ -264,7 +264,10 @@ impl NntpConnection {
             %addr,
             ssl = config.ssl,
             ssl_verify = config.ssl_verify,
-            username = config.username.as_deref().unwrap_or("(none)"),
+            // Avoid logging the username — it may be PII for email-shaped
+            // logins, an account identifier worth protecting in shared logs.
+            // Just record whether credentials were configured.
+            authenticated = config.username.is_some(),
             connections = config.connections,
             compress = config.compress,
             "NNTP connecting"
@@ -314,6 +317,7 @@ impl NntpConnection {
 
         // 2. Optional TLS
         if config.ssl {
+            info!(server = %self.server_id, %addr, ssl_verify = config.ssl_verify, "TLS handshake starting");
             let tls_config = build_tls_config(config.ssl_verify)?;
             let connector = TlsConnector::from(Arc::new(tls_config));
 
@@ -400,12 +404,16 @@ impl NntpConnection {
             .as_deref()
             .ok_or_else(|| NntpError::Auth("No username configured".into()))?;
 
+        // NB: do not log the username field at info — it can be PII for
+        // email-shaped logins. The fact that authentication is starting is
+        // already implied by the connection-attempt log; downgrade detail
+        // to debug.
         info!(
             server = %self.server_id,
             host = %config.host,
-            username = %username,
             "NNTP authenticating (AUTHINFO USER)"
         );
+        debug!(server = %self.server_id, username = %username, "AUTHINFO USER detail");
 
         // Try AUTHINFO USER first (RFC 4643), fall back to USER (RFC 2980)
         self.send_command(&format!("AUTHINFO USER {username}"))
@@ -547,6 +555,7 @@ impl NntpConnection {
 
     /// Negotiate XFEATURE COMPRESS GZIP with the server.
     async fn negotiate_compression(&mut self) -> NntpResult<()> {
+        debug!(server = %self.server_id, "Compression negotiation starting (LIST EXTENSIONS)");
         self.send_command("LIST EXTENSIONS").await?;
         let resp = self.read_response_line().await?;
 

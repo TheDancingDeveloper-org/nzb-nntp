@@ -3,15 +3,87 @@
 //! Provides a configurable NNTP server that runs as a tokio task for unit testing.
 //! Supports: AUTH, GROUP, XOVER, BODY, ARTICLE, STAT, QUIT with configurable
 //! responses and error injection.
+//!
+//! ## Fault injection
+//!
+//! `MockConfig` exposes several primitives that simulate real-world provider
+//! pathologies which the worker pool, stall detector, and connection tracker
+//! must survive without producing zombie connections or stuck jobs:
+//!
+//! - `silent_close_after_bytes` — close the socket after writing N bytes (no
+//!   QUIT, no error response). Simulates a provider that drops the session.
+//! - `hang_after_command` — stop responding after seeing a specific verb.
+//!   Reads incoming bytes and discards them. Simulates a provider that has
+//!   stalled mid-session.
+//! - `close_after_n_commands` — force a disconnect after N commands processed.
+//!   Simulates a provider that recycles connections aggressively.
+//! - `response_delay` — sleep before each write. Simulates a slow provider.
+//! - `article_response_overrides` — return a custom NNTP response code (430,
+//!   502, 403, etc.) for a specific message-id, regardless of whether the
+//!   article exists. Simulates retention drift, throttling, and access denial.
+//! - `auth_rate_limit` — reject auth attempts after N within a sliding window.
+//!   State is shared across all connections to the same `MockNntpServer`.
+//!   Simulates account-level rate limiting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
+
+// ---------------------------------------------------------------------------
+// Auth rate limiter (cross-connection state)
+// ---------------------------------------------------------------------------
+
+/// Sliding-window auth rate limiter. State is shared across all connections
+/// to the same `MockNntpServer` so that a burst of reconnects can trip the
+/// limiter the same way a real provider would.
+pub struct AuthRateLimit {
+    pub max_attempts: u32,
+    pub window: Duration,
+    state: Arc<Mutex<VecDeque<Instant>>>,
+}
+
+impl AuthRateLimit {
+    pub fn new(max_attempts: u32, window: Duration) -> Self {
+        Self {
+            max_attempts,
+            window,
+            state: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Record an auth attempt. Returns `true` if the attempt should be
+    /// rejected (limit exceeded within the current window).
+    fn check_and_record(&self) -> bool {
+        let now = Instant::now();
+        let mut s = self.state.lock();
+        while let Some(&front) = s.front() {
+            if now.duration_since(front) > self.window {
+                s.pop_front();
+            } else {
+                break;
+            }
+        }
+        s.push_back(now);
+        s.len() as u32 > self.max_attempts
+    }
+}
+
+impl Clone for AuthRateLimit {
+    fn clone(&self) -> Self {
+        Self {
+            max_attempts: self.max_attempts,
+            window: self.window,
+            state: Arc::clone(&self.state),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -44,6 +116,30 @@ pub struct MockConfig {
     pub xpat_entries: Vec<String>,
     /// LIST ACTIVE entries as pre-formatted `groupname last first status` lines.
     pub list_active_entries: Vec<String>,
+
+    // ---- Fault injection (test-support feature) ----
+    /// Close the socket silently after writing this many total bytes. The
+    /// last write is truncated to the limit; no QUIT or error response is
+    /// emitted. Simulates a provider that drops the session.
+    pub silent_close_after_bytes: Option<usize>,
+    /// Stop responding after seeing this command verb. The connection
+    /// continues to read incoming bytes (and discards them) but emits no
+    /// further responses. Simulates a stalled provider.
+    pub hang_after_command: Option<String>,
+    /// Force the connection closed after processing this many commands.
+    /// Simulates a provider that recycles sessions.
+    pub close_after_n_commands: Option<u32>,
+    /// Sleep this long before each response write. Applied uniformly to
+    /// every write, not just per-command. Simulates a slow provider.
+    pub response_delay: Option<Duration>,
+    /// Override response codes for specific message-ids on ARTICLE/BODY/STAT.
+    /// The override always wins over the `articles` map and never returns a
+    /// body. Use to inject 430 (not found), 502 (server down), 403
+    /// (forbidden) etc. for individual articles.
+    pub article_response_overrides: HashMap<String, u16>,
+    /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
+    /// attempts within the `window`, all subsequent auths return 481.
+    pub auth_rate_limit: Option<AuthRateLimit>,
 }
 
 impl Default for MockConfig {
@@ -61,6 +157,12 @@ impl Default for MockConfig {
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
             list_active_entries: Vec::new(),
+            silent_close_after_bytes: None,
+            hang_after_command: None,
+            close_after_n_commands: None,
+            response_delay: None,
+            article_response_overrides: HashMap::new(),
+            auth_rate_limit: None,
         }
     }
 }
@@ -146,13 +248,83 @@ pub fn test_config_with_auth(port: u16, user: &str, pass: &str) -> ServerConfig 
 }
 
 // ---------------------------------------------------------------------------
+// Per-connection state + write helper
+// ---------------------------------------------------------------------------
+
+/// Per-connection state used to thread fault-injection through every write.
+struct ConnState<'a> {
+    stream: &'a mut BufReader<tokio::net::TcpStream>,
+    config: &'a MockConfig,
+    bytes_written: usize,
+    hung: bool,
+}
+
+impl<'a> ConnState<'a> {
+    fn new(stream: &'a mut BufReader<tokio::net::TcpStream>, config: &'a MockConfig) -> Self {
+        Self {
+            stream,
+            config,
+            bytes_written: 0,
+            hung: false,
+        }
+    }
+
+    /// Write `data` honouring fault injection. Returns `false` if the
+    /// connection should close (silent_close_after_bytes hit, or we are in
+    /// hang mode and the caller asked to write something).
+    async fn write(&mut self, data: &[u8]) -> bool {
+        if self.hung {
+            return true;
+        }
+
+        if let Some(delay) = self.config.response_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        if let Some(limit) = self.config.silent_close_after_bytes {
+            if self.bytes_written >= limit {
+                return false;
+            }
+            if self.bytes_written + data.len() > limit {
+                let to_write = limit - self.bytes_written;
+                let _ = self.stream.get_mut().write_all(&data[..to_write]).await;
+                let _ = self.stream.get_mut().flush().await;
+                self.bytes_written += to_write;
+                return false;
+            }
+        }
+
+        if self.stream.get_mut().write_all(data).await.is_err() {
+            return false;
+        }
+        self.bytes_written += data.len();
+        true
+    }
+
+    async fn flush(&mut self) {
+        if !self.hung {
+            let _ = self.stream.get_mut().flush().await;
+        }
+    }
+}
+
+/// Write `bytes`; if the helper signals close, return from the enclosing fn.
+macro_rules! mwrite {
+    ($conn:expr, $bytes:expr) => {
+        if !$conn.write($bytes).await {
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig>) {
     let mut stream = BufReader::new(stream);
 
-    // Send welcome banner
+    // Send welcome banner (or 502 + bail).
     if config.service_unavailable {
         let _ = stream
             .get_mut()
@@ -162,17 +334,21 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
         return;
     }
 
+    let mut conn = ConnState::new(&mut stream, &config);
+
     let welcome = format!("{} {}\r\n", config.welcome_code, config.welcome_message);
-    let _ = stream.get_mut().write_all(welcome.as_bytes()).await;
-    let _ = stream.get_mut().flush().await;
+    mwrite!(conn, welcome.as_bytes());
+    conn.flush().await;
 
     let mut authenticated = !config.auth_required;
     let mut selected_group: Option<String> = None;
+    let mut commands_processed: u32 = 0;
     let mut line = String::new();
 
     loop {
         line.clear();
-        match stream.read_line(&mut line).await {
+        let read_result = conn.stream.read_line(&mut line).await;
+        match read_result {
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => break,
@@ -186,10 +362,20 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
         let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
         let cmd = parts[0].to_uppercase();
 
+        // hang_after_command: once we see this verb, mark the connection as
+        // hung. We continue reading bytes (so the client doesn't see EOF) but
+        // emit nothing. The client should hit its own stall detection.
+        if let Some(ref hang_cmd) = config.hang_after_command
+            && !conn.hung
+            && cmd == hang_cmd.to_uppercase()
+        {
+            conn.hung = true;
+        }
+
         match cmd.as_str() {
             "QUIT" => {
-                let _ = stream.get_mut().write_all(b"205 Goodbye\r\n").await;
-                let _ = stream.get_mut().flush().await;
+                mwrite!(conn, b"205 Goodbye\r\n");
+                conn.flush().await;
                 break;
             }
 
@@ -198,265 +384,254 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                 match sub.as_str() {
                     "USER" => {
                         if config.fail_auth {
-                            let _ = stream
-                                .get_mut()
-                                .write_all(b"482 Authentication rejected\r\n")
-                                .await;
+                            mwrite!(conn, b"482 Authentication rejected\r\n");
                         } else {
-                            let _ = stream
-                                .get_mut()
-                                .write_all(b"381 Password required\r\n")
-                                .await;
+                            mwrite!(conn, b"381 Password required\r\n");
                         }
                     }
                     "PASS" => {
-                        if config.fail_auth {
-                            let _ = stream
-                                .get_mut()
-                                .write_all(b"481 Authentication failed\r\n")
-                                .await;
+                        // Cross-connection rate limit takes precedence.
+                        let rate_limited = config
+                            .auth_rate_limit
+                            .as_ref()
+                            .map(|r| r.check_and_record())
+                            .unwrap_or(false);
+
+                        if rate_limited {
+                            mwrite!(conn, b"481 Authentication rate-limited\r\n");
+                        } else if config.fail_auth {
+                            mwrite!(conn, b"481 Authentication failed\r\n");
                         } else if let Some((_, ref valid_pass)) = config.valid_credentials {
                             let given = parts.get(2).unwrap_or(&"");
                             if *given == valid_pass.as_str() {
                                 authenticated = true;
-                                let _ = stream
-                                    .get_mut()
-                                    .write_all(b"281 Authentication accepted\r\n")
-                                    .await;
+                                mwrite!(conn, b"281 Authentication accepted\r\n");
                             } else {
-                                let _ = stream
-                                    .get_mut()
-                                    .write_all(b"481 Authentication failed\r\n")
-                                    .await;
+                                mwrite!(conn, b"481 Authentication failed\r\n");
                             }
                         } else {
                             // No specific credentials — accept anything
                             authenticated = true;
-                            let _ = stream
-                                .get_mut()
-                                .write_all(b"281 Authentication accepted\r\n")
-                                .await;
+                            mwrite!(conn, b"281 Authentication accepted\r\n");
                         }
                     }
                     _ => {
-                        let _ = stream
-                            .get_mut()
-                            .write_all(b"500 Unknown AUTHINFO subcommand\r\n")
-                            .await;
+                        mwrite!(conn, b"500 Unknown AUTHINFO subcommand\r\n");
                     }
                 }
             }
 
             "GROUP" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else {
                     let name = parts.get(1).unwrap_or(&"");
                     if let Some(&(count, first, last)) = config.groups.get(*name) {
                         selected_group = Some(name.to_string());
                         let resp = format!("211 {} {} {} {}\r\n", count, first, last, name);
-                        let _ = stream.get_mut().write_all(resp.as_bytes()).await;
+                        mwrite!(conn, resp.as_bytes());
                     } else {
-                        let _ = stream.get_mut().write_all(b"411 No such group\r\n").await;
+                        mwrite!(conn, b"411 No such group\r\n");
                     }
                 }
             }
 
             "XOVER" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else if selected_group.is_none() {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"412 No newsgroup selected\r\n")
-                        .await;
+                    mwrite!(conn, b"412 No newsgroup selected\r\n");
                 } else if config.xover_entries.is_empty() {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"420 No articles in range\r\n")
-                        .await;
+                    mwrite!(conn, b"420 No articles in range\r\n");
                 } else {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"224 Overview data follows\r\n")
-                        .await;
+                    mwrite!(conn, b"224 Overview data follows\r\n");
                     for entry in &config.xover_entries {
-                        let _ = stream.get_mut().write_all(entry.as_bytes()).await;
-                        let _ = stream.get_mut().write_all(b"\r\n").await;
+                        mwrite!(conn, entry.as_bytes());
+                        mwrite!(conn, b"\r\n");
                     }
-                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                    mwrite!(conn, b".\r\n");
                 }
             }
 
             "XHDR" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else if config.xhdr_entries.is_empty() {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"420 No articles in range\r\n")
-                        .await;
+                    mwrite!(conn, b"420 No articles in range\r\n");
                 } else {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"221 Header data follows\r\n")
-                        .await;
+                    mwrite!(conn, b"221 Header data follows\r\n");
                     for entry in &config.xhdr_entries {
-                        let _ = stream.get_mut().write_all(entry.as_bytes()).await;
-                        let _ = stream.get_mut().write_all(b"\r\n").await;
+                        mwrite!(conn, entry.as_bytes());
+                        mwrite!(conn, b"\r\n");
                     }
-                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                    mwrite!(conn, b".\r\n");
                 }
             }
 
             "XPAT" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else if config.xpat_entries.is_empty() {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"420 No articles matched\r\n")
-                        .await;
+                    mwrite!(conn, b"420 No articles matched\r\n");
                 } else {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"221 Header data follows\r\n")
-                        .await;
+                    mwrite!(conn, b"221 Header data follows\r\n");
                     for entry in &config.xpat_entries {
-                        let _ = stream.get_mut().write_all(entry.as_bytes()).await;
-                        let _ = stream.get_mut().write_all(b"\r\n").await;
+                        mwrite!(conn, entry.as_bytes());
+                        mwrite!(conn, b"\r\n");
                     }
-                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                    mwrite!(conn, b".\r\n");
                 }
             }
 
             "LIST" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else if config.list_active_entries.is_empty() {
-                    // Empty list is still a valid 215 response
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"215 List of newsgroups follows\r\n")
-                        .await;
-                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                    mwrite!(conn, b"215 List of newsgroups follows\r\n");
+                    mwrite!(conn, b".\r\n");
                 } else {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"215 List of newsgroups follows\r\n")
-                        .await;
+                    mwrite!(conn, b"215 List of newsgroups follows\r\n");
                     for entry in &config.list_active_entries {
-                        let _ = stream.get_mut().write_all(entry.as_bytes()).await;
-                        let _ = stream.get_mut().write_all(b"\r\n").await;
+                        mwrite!(conn, entry.as_bytes());
+                        mwrite!(conn, b"\r\n");
                     }
-                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                    mwrite!(conn, b".\r\n");
                 }
             }
 
             "ARTICLE" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else {
                     let mid = parts
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if let Some(data) = config.articles.get(mid) {
+                    if let Some(&code) = config.article_response_overrides.get(mid) {
+                        let resp = format!("{} <{}>\r\n", code, mid);
+                        mwrite!(conn, resp.as_bytes());
+                    } else if let Some(data) = config.articles.get(mid) {
                         let header = format!("220 0 <{}>\r\n", mid);
-                        let _ = stream.get_mut().write_all(header.as_bytes()).await;
-                        write_multiline_body(stream.get_mut(), data).await;
+                        mwrite!(conn, header.as_bytes());
+                        if !write_multiline_body(&mut conn, data).await {
+                            return;
+                        }
                     } else {
                         let resp = format!("430 No article: <{}>\r\n", mid);
-                        let _ = stream.get_mut().write_all(resp.as_bytes()).await;
+                        mwrite!(conn, resp.as_bytes());
                     }
                 }
             }
 
             "BODY" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else {
                     let mid = parts
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if let Some(data) = config.articles.get(mid) {
+                    if let Some(&code) = config.article_response_overrides.get(mid) {
+                        let resp = format!("{} <{}>\r\n", code, mid);
+                        mwrite!(conn, resp.as_bytes());
+                    } else if let Some(data) = config.articles.get(mid) {
                         let header = format!("222 0 <{}>\r\n", mid);
-                        let _ = stream.get_mut().write_all(header.as_bytes()).await;
-                        write_multiline_body(stream.get_mut(), data).await;
+                        mwrite!(conn, header.as_bytes());
+                        if !write_multiline_body(&mut conn, data).await {
+                            return;
+                        }
                     } else {
                         let resp = format!("430 No article: <{}>\r\n", mid);
-                        let _ = stream.get_mut().write_all(resp.as_bytes()).await;
+                        mwrite!(conn, resp.as_bytes());
                     }
                 }
             }
 
             "STAT" => {
                 if !authenticated {
-                    let _ = stream
-                        .get_mut()
-                        .write_all(b"480 Authentication required\r\n")
-                        .await;
+                    mwrite!(conn, b"480 Authentication required\r\n");
                 } else {
                     let mid = parts
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if config.articles.contains_key(mid) {
+                    if let Some(&code) = config.article_response_overrides.get(mid) {
+                        let resp = format!("{} <{}>\r\n", code, mid);
+                        mwrite!(conn, resp.as_bytes());
+                    } else if config.articles.contains_key(mid) {
                         let resp = format!("223 0 <{}>\r\n", mid);
-                        let _ = stream.get_mut().write_all(resp.as_bytes()).await;
+                        mwrite!(conn, resp.as_bytes());
                     } else {
                         let resp = format!("430 No article: <{}>\r\n", mid);
-                        let _ = stream.get_mut().write_all(resp.as_bytes()).await;
+                        mwrite!(conn, resp.as_bytes());
                     }
                 }
             }
 
             _ => {
                 let resp = format!("500 Unknown command: {}\r\n", cmd);
-                let _ = stream.get_mut().write_all(resp.as_bytes()).await;
+                mwrite!(conn, resp.as_bytes());
             }
         }
 
-        let _ = stream.get_mut().flush().await;
+        conn.flush().await;
+
+        commands_processed += 1;
+        if let Some(limit) = config.close_after_n_commands
+            && commands_processed >= limit
+        {
+            return;
+        }
     }
 }
 
-/// Write a multiline body with dot-stuffing and `.\r\n` terminator.
-async fn write_multiline_body(writer: &mut tokio::net::TcpStream, data: &[u8]) {
-    let text = String::from_utf8_lossy(data);
-    for line in text.lines() {
-        if line.starts_with('.') {
-            let _ = writer.write_all(b".").await; // dot-stuff
+/// Write a multiline body with dot-stuffing and `.\r\n` terminator. Operates
+/// on raw bytes — must NOT lossy-UTF-8-convert because article bodies can be
+/// binary (yEnc-encoded payloads contain non-UTF-8 byte sequences). Accepts
+/// either `\n`- or `\r\n`-delimited input lines and emits canonical `\r\n`.
+/// Returns `false` if the connection should close (silent_close_after_bytes hit).
+async fn write_multiline_body(conn: &mut ConnState<'_>, data: &[u8]) -> bool {
+    let mut start = 0usize;
+    let mut wrote_anything = false;
+    while start < data.len() {
+        // Find the next \n; if there isn't one, the rest is a final line
+        // without a trailing newline (we add one ourselves).
+        let nl_pos = data[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| start + p);
+        let line_end = nl_pos.unwrap_or(data.len());
+
+        // Strip a trailing \r so callers can supply either \n- or \r\n-
+        // delimited input.
+        let mut line = &data[start..line_end];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
         }
-        let _ = writer.write_all(line.as_bytes()).await;
-        let _ = writer.write_all(b"\r\n").await;
+
+        wrote_anything = true;
+        // Dot-stuff: if a line begins with '.', prepend another '.'.
+        if line.first() == Some(&b'.') && !conn.write(b".").await {
+            return false;
+        }
+        if !conn.write(line).await {
+            return false;
+        }
+        if !conn.write(b"\r\n").await {
+            return false;
+        }
+
+        start = match nl_pos {
+            Some(p) => p + 1,
+            None => data.len(),
+        };
     }
-    // If data was empty, lines() yields nothing — just write terminator
-    if data.is_empty() {
-        let _ = writer.write_all(b"\r\n").await;
+    if !wrote_anything && !conn.write(b"\r\n").await {
+        return false;
     }
-    let _ = writer.write_all(b".\r\n").await;
-    let _ = writer.flush().await;
+    if !conn.write(b".\r\n").await {
+        return false;
+    }
+    conn.flush().await;
+    true
 }
