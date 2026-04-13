@@ -21,7 +21,13 @@ use tracing::{debug, info, trace, warn};
 /// Timeout for reading a single response line from the server.
 /// If the server doesn't respond within this window, the connection is
 /// considered dead and an I/O error is returned so workers can reconnect.
-const READ_LINE_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// Set to 60s: XOVER on large (25K+ article) ranges can legitimately take
+/// 30-45s for the server to return the first response line, especially
+/// under high concurrency where the overview DB is contended. 20s was
+/// too aggressive and killed healthy connections, causing reconnection
+/// churn and losing in-flight pipelined commands.
+const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for reading each line of a multi-line body (article data).
 /// This is per-line, not per-article — large articles get many lines but
