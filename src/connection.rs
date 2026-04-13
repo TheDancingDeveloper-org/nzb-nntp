@@ -21,12 +21,12 @@ use tracing::{debug, info, trace, warn};
 /// Timeout for reading a single response line from the server.
 /// If the server doesn't respond within this window, the connection is
 /// considered dead and an I/O error is returned so workers can reconnect.
-const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Timeout for reading each line of a multi-line body (article data).
 /// This is per-line, not per-article — large articles get many lines but
 /// each individual line read must complete within this window.
-const READ_BODY_LINE_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_BODY_LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 use crate::config::{ListActiveEntry, ServerConfig};
 
@@ -650,14 +650,22 @@ impl NntpConnection {
         self.state = ConnectionState::Busy;
 
         let mid = normalize_message_id(message_id);
-        self.send_command(&format!("ARTICLE {mid}")).await?;
+        self.send_command(&format!("ARTICLE {mid}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
-        let status = self.read_response_line().await?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             220 => {
                 // Article follows — read multi-line body
-                let data = self.read_multiline_body_maybe_decompress().await?;
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 Ok(NntpResponse {
                     code: status.code,
@@ -748,9 +756,14 @@ impl NntpConnection {
         self.state = ConnectionState::Busy;
 
         let mid = normalize_message_id(message_id);
-        self.send_command(&format!("STAT {mid}")).await?;
+        self.send_command(&format!("STAT {mid}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
-        let resp = self.read_response_line().await?;
+        let resp = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
         self.state = ConnectionState::Ready;
 
         match resp.code {
@@ -791,8 +804,13 @@ impl NntpConnection {
         }
         self.state = ConnectionState::Busy;
 
-        self.send_command(&format!("GROUP {name}")).await?;
-        let resp = self.read_response_line().await?;
+        self.send_command(&format!("GROUP {name}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let resp = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         self.state = ConnectionState::Ready;
 
@@ -860,12 +878,20 @@ impl NntpConnection {
         self.state = ConnectionState::Busy;
         let t_xover = Instant::now();
 
-        self.send_command(&format!("XOVER {start}-{end}")).await?;
-        let status = self.read_response_line().await?;
+        self.send_command(&format!("XOVER {start}-{end}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             224 => {
-                let data = self.read_multiline_body_maybe_decompress().await?;
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 let entries = parse_xover_data(&data);
                 debug!(
@@ -933,12 +959,20 @@ impl NntpConnection {
         self.state = ConnectionState::Busy;
 
         let arg = range.to_command_arg();
-        self.send_command(&format!("XHDR {header} {arg}")).await?;
-        let status = self.read_response_line().await?;
+        self.send_command(&format!("XHDR {header} {arg}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             221 => {
-                let data = self.read_multiline_body_maybe_decompress().await?;
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 Ok(parse_header_data(&data))
             }
@@ -1007,12 +1041,19 @@ impl NntpConnection {
         let arg = range.to_command_arg();
         let pattern_str = patterns.join(" ");
         self.send_command(&format!("XPAT {header} {arg} {pattern_str}"))
-            .await?;
-        let status = self.read_response_line().await?;
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             221 => {
-                let data = self.read_multiline_body_maybe_decompress().await?;
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 Ok(parse_header_data(&data))
             }
@@ -1068,12 +1109,20 @@ impl NntpConnection {
         self.state = ConnectionState::Busy;
 
         let mid = normalize_message_id(message_id);
-        self.send_command(&format!("BODY {mid}")).await?;
-        let status = self.read_response_line().await?;
+        self.send_command(&format!("BODY {mid}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             222 => {
-                let data = self.read_multiline_body_maybe_decompress().await?;
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 Ok(NntpResponse {
                     code: status.code,
@@ -1138,12 +1187,20 @@ impl NntpConnection {
             Some(pattern) => format!("LIST ACTIVE {pattern}"),
             None => "LIST ACTIVE".to_string(),
         };
-        self.send_command(&cmd).await?;
-        let status = self.read_response_line().await?;
+        self.send_command(&cmd)
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             215 => {
-                let data = self.read_multiline_body_maybe_decompress().await?;
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 Ok(parse_list_active_data(&data))
             }
@@ -1192,8 +1249,13 @@ impl NntpConnection {
         self.state = ConnectionState::Busy;
 
         // Send POST command
-        self.send_command("POST").await?;
-        let status = self.read_response_line().await?;
+        self.send_command("POST")
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
 
         match status.code {
             340 => {
@@ -1209,20 +1271,32 @@ impl NntpConnection {
                         transport
                             .write_all(format!(".{line}\r\n").as_bytes())
                             .await
-                            .map_err(NntpError::Io)?;
+                            .map_err(|e| {
+                                self.state = ConnectionState::Error;
+                                NntpError::Io(e)
+                            })?;
                     } else {
                         transport
                             .write_all(format!("{line}\r\n").as_bytes())
                             .await
-                            .map_err(NntpError::Io)?;
+                            .map_err(|e| {
+                                self.state = ConnectionState::Error;
+                                NntpError::Io(e)
+                            })?;
                     }
                 }
 
                 // Send termination line
-                transport.write_all(b".\r\n").await.map_err(NntpError::Io)?;
+                transport.write_all(b".\r\n").await.map_err(|e| {
+                    self.state = ConnectionState::Error;
+                    NntpError::Io(e)
+                })?;
 
                 // Read final response
-                let result = self.read_response_line().await?;
+                let result = self
+                    .read_response_line()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
                 Ok(result)
             }
