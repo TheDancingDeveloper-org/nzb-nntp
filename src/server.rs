@@ -297,6 +297,7 @@ mod tests {
             ramp_up_delay_ms: 0,
             recv_buffer_size: 0,
             proxy_url: None,
+            trusted_fingerprint: None,
         }
     }
 

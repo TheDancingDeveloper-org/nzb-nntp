@@ -1,6 +1,6 @@
 [package]
 name = "nzb-nntp"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2024"
 description = "Async NNTP client with TLS, pipelining, connection pooling, and multi-server support"
 license = "MIT"
@@ -20,6 +20,7 @@ webpki-roots = "1"
 rustls-pki-types = "1"
 parking_lot = "0.12"
 flate2 = "1"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 socket2 = "0.5"
 tokio-socks = "0.5"

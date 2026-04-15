@@ -325,7 +325,7 @@ impl NntpConnection {
         // 2. Optional TLS
         if config.ssl {
             info!(server = %self.server_id, %addr, ssl_verify = config.ssl_verify, "TLS handshake starting");
-            let tls_config = build_tls_config(config.ssl_verify)?;
+            let tls_config = build_tls_config(config.ssl_verify, config.trusted_fingerprint.as_deref())?;
             let connector = TlsConnector::from(Arc::new(tls_config));
 
             let server_name =
@@ -1656,10 +1656,34 @@ fn parse_socks5_url(url: &str) -> Result<Socks5Proxy, String> {
 
 /// Build a `rustls::ClientConfig` for NNTP TLS connections.
 ///
+/// Three verification modes, in priority order:
+///   1. `trusted_fingerprint` set → match server cert SHA-256 only
+///      (hostname / CA chain ignored). For pinning self-signed certs.
+///   2. `verify_certs=true`        → full WebPKI validation against built-in
+///      trust roots (standard mode for public servers).
+///   3. `verify_certs=false`       → accept any cert (insecure; dev/test).
+///
 /// Uses the `ring` crypto provider explicitly so callers don't need to install
 /// a process-level default via `CryptoProvider::install_default()`.
-fn build_tls_config(verify_certs: bool) -> NntpResult<rustls::ClientConfig> {
+fn build_tls_config(
+    verify_certs: bool,
+    trusted_fingerprint: Option<&str>,
+) -> NntpResult<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+    if let Some(fp_hex) = trusted_fingerprint {
+        let expected = parse_fingerprint(fp_hex)
+            .ok_or_else(|| NntpError::Connection(format!("invalid trusted_fingerprint: {fp_hex}")))?;
+        let verifier = Arc::new(FingerprintVerifier { expected });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| NntpError::Connection(format!("TLS config error: {e}")))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        return Ok(config);
+    }
+
     if verify_certs {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1671,7 +1695,6 @@ fn build_tls_config(verify_certs: bool) -> NntpResult<rustls::ClientConfig> {
             .with_no_client_auth();
         Ok(config)
     } else {
-        // Dangerous: skip certificate verification (user opted out)
         let config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| NntpError::Connection(format!("TLS config error: {e}")))?
@@ -1680,6 +1703,85 @@ fn build_tls_config(verify_certs: bool) -> NntpResult<rustls::ClientConfig> {
             .with_no_client_auth();
         Ok(config)
     }
+}
+
+/// Parse a hex SHA-256 fingerprint (optional colons, any case) into 32 bytes.
+fn parse_fingerprint(s: &str) -> Option<[u8; 32]> {
+    let cleaned: String = s.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+    if cleaned.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in cleaned.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Accepts the server cert iff SHA-256(DER) == `expected`. Hostname,
+/// expiry, and CA chain are not validated.
+#[derive(Debug)]
+struct FingerprintVerifier {
+    expected: [u8; 32],
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        let got = Sha256::digest(end_entity.as_ref());
+        if got.as_slice() == self.expected.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "server cert fingerprint mismatch (expected {}, got {})",
+                hex_encode_short(&self.expected),
+                hex_encode_short(&got),
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn hex_encode_short(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let take = bytes.len().min(8);
+    let mut s = String::with_capacity(take * 2);
+    for b in &bytes[..take] {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// A certificate verifier that accepts any certificate (for `ssl_verify: false`).
@@ -1738,6 +1840,32 @@ mod tests {
         let resp = parse_response_line("200 NNTP Service Ready\r\n").unwrap();
         assert_eq!(resp.code, 200);
         assert_eq!(resp.message, "NNTP Service Ready");
+    }
+
+    #[test]
+    fn parse_fingerprint_accepts_various_formats() {
+        let hex = "40f9310af55480b2d2f1d6e253bb557c7ab5cbdb2f2a417903aada0a131ad9c0";
+        let upper = hex.to_uppercase();
+        let colons = "40:f9:31:0a:f5:54:80:b2:d2:f1:d6:e2:53:bb:55:7c:\
+                      7a:b5:cb:db:2f:2a:41:79:03:aa:da:0a:13:1a:d9:c0";
+        let spaced = "40 f9 31 0a f5 54 80 b2 d2 f1 d6 e2 53 bb 55 7c 7a b5 cb db 2f 2a 41 79 03 aa da 0a 13 1a d9 c0";
+        let expected = parse_fingerprint(hex).unwrap();
+        assert_eq!(parse_fingerprint(&upper).unwrap(), expected);
+        assert_eq!(parse_fingerprint(colons).unwrap(), expected);
+        assert_eq!(parse_fingerprint(spaced).unwrap(), expected);
+        assert!(parse_fingerprint("too-short").is_none());
+        assert!(parse_fingerprint(&format!("{hex}extra")).is_none());
+        assert!(parse_fingerprint("zz".repeat(32).as_str()).is_none());
+    }
+
+    #[test]
+    fn fingerprint_mode_overrides_verify_certs_flag() {
+        let fp = "40f9310af55480b2d2f1d6e253bb557c7ab5cbdb2f2a417903aada0a131ad9c0";
+        // Should succeed regardless of verify_certs — fingerprint takes priority.
+        let _cfg_a = build_tls_config(true, Some(fp)).expect("fingerprint+verify");
+        let _cfg_b = build_tls_config(false, Some(fp)).expect("fingerprint+noverify");
+        // Malformed fingerprint → error.
+        assert!(build_tls_config(true, Some("not-hex")).is_err());
     }
 
     #[test]

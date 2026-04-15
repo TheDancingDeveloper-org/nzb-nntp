@@ -47,6 +47,12 @@ pub struct ServerConfig {
     /// Optional SOCKS5 proxy URL: `socks5://[username:password@]host:port`
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Optional SHA-256 fingerprint (hex, any case) of the server's end-entity
+    /// cert. When set, TLS validation matches this fingerprint *only* —
+    /// WebPKI chain validation is bypassed, and `ssl_verify` is ignored.
+    /// Use this to pin self-signed certs for a bundled client binary.
+    #[serde(default)]
+    pub trusted_fingerprint: Option<String>,
 }
 
 /// Default TCP receive buffer: 2 MiB.
@@ -86,6 +92,7 @@ impl Default for ServerConfig {
             ramp_up_delay_ms: 250,
             recv_buffer_size: default_recv_buffer_size(),
             proxy_url: None,
+            trusted_fingerprint: None,
         }
     }
 }
@@ -181,6 +188,7 @@ mod tests {
             ramp_up_delay_ms: 500,
             recv_buffer_size: 2 * 1024 * 1024,
             proxy_url: Some("socks5://proxy:1080".to_string()),
+            trusted_fingerprint: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
