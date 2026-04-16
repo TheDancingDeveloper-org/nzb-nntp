@@ -10,6 +10,7 @@
 //! 5. QUIT -> close
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -217,6 +218,29 @@ impl Transport {
 // ---------------------------------------------------------------------------
 
 /// A single NNTP connection to one server.
+/// Socket-level liveness heartbeat.
+///
+/// Supplied by the caller so a higher-level watchdog (e.g. nzb-web's idle
+/// worker supervisor) can distinguish a **slow-but-alive** connection from a
+/// **silent/zombied** one. Every successful line read from the NNTP socket
+/// ticks the heartbeat — matches SABnzbd's `nw.timeout` model, which resets
+/// on any data reception (`newswrapper.py:315`), not on article completion.
+///
+/// The caller owns the `Arc<AtomicU64>` and compares stored values against
+/// its own clock. The stored value is millis since `epoch`.
+#[derive(Clone)]
+struct IoHeartbeat {
+    timestamp_ms: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl IoHeartbeat {
+    fn tick(&self) {
+        self.timestamp_ms
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
 pub struct NntpConnection {
     /// Server identifier (matches `ServerConfig::id`).
     pub server_id: String,
@@ -226,6 +250,12 @@ pub struct NntpConnection {
     transport: Option<Transport>,
     /// Whether XFEATURE COMPRESS GZIP is active on this connection.
     compress_enabled: bool,
+    /// Optional socket-liveness heartbeat. When set, every successful line
+    /// read from the socket updates the stored timestamp (millis since
+    /// `epoch`). Higher-level watchdogs use this to avoid false-positive
+    /// evictions of workers that are legitimately mid-article with slow
+    /// provider response times.
+    io_heartbeat: Option<IoHeartbeat>,
 }
 
 impl NntpConnection {
@@ -236,6 +266,34 @@ impl NntpConnection {
             state: ConnectionState::Disconnected,
             transport: None,
             compress_enabled: false,
+            io_heartbeat: None,
+        }
+    }
+
+    /// Attach a socket-liveness heartbeat. Every successful line read from
+    /// the socket will store `epoch.elapsed().as_millis() as u64` in
+    /// `timestamp_ms`. Callers (e.g. nzb-web's idle-worker watchdog) compare
+    /// against their own clock to detect truly silent/zombied connections
+    /// without false-positively evicting slow-but-working workers.
+    ///
+    /// Mirrors SABnzbd's `nw.timeout` update on any data reception
+    /// (`sabnzbd/newswrapper.py:315`).
+    ///
+    /// Optional: connections without a heartbeat behave exactly as before
+    /// (no-op), so existing callers / tests are unaffected.
+    pub fn set_io_heartbeat(&mut self, timestamp_ms: Arc<AtomicU64>, epoch: Instant) {
+        self.io_heartbeat = Some(IoHeartbeat {
+            timestamp_ms,
+            epoch,
+        });
+    }
+
+    /// Internal: tick the heartbeat if one is attached. Called after every
+    /// successful byte read from the underlying socket.
+    #[inline]
+    fn tick_io_heartbeat(&self) {
+        if let Some(hb) = &self.io_heartbeat {
+            hb.tick();
         }
     }
 
@@ -325,7 +383,8 @@ impl NntpConnection {
         // 2. Optional TLS
         if config.ssl {
             info!(server = %self.server_id, %addr, ssl_verify = config.ssl_verify, "TLS handshake starting");
-            let tls_config = build_tls_config(config.ssl_verify, config.trusted_fingerprint.as_deref())?;
+            let tls_config =
+                build_tls_config(config.ssl_verify, config.trusted_fingerprint.as_deref())?;
             let connector = TlsConnector::from(Arc::new(tls_config));
 
             let server_name =
@@ -1428,12 +1487,21 @@ impl NntpConnection {
             return Err(NntpError::Connection("Server closed connection".into()));
         }
 
+        // Successful read → connection is alive. Tick the liveness heartbeat
+        // so higher-level watchdogs don't falsely evict slow-but-working
+        // workers. Matches SABnzbd's per-byte timeout reset model.
+        self.tick_io_heartbeat();
+
         parse_response_line(&line)
     }
 
     /// Read a multi-line body terminated by `.\r\n`. Un-does dot-stuffing.
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
+        // Clone the heartbeat ref before we take the mutable borrow on
+        // `transport`, so we can tick it inside the loop body. Cheap: just
+        // an Arc clone plus an Instant copy.
+        let heartbeat = self.io_heartbeat.clone();
         let transport = self
             .transport
             .as_mut()
@@ -1471,6 +1539,13 @@ impl NntpConnection {
                 return Err(NntpError::Connection(
                     "Server closed connection during multi-line read".into(),
                 ));
+            }
+
+            // Successful read → connection is alive. Tick the liveness
+            // heartbeat on every line of a multi-line body so the watchdog
+            // sees steady activity during large articles.
+            if let Some(hb) = &heartbeat {
+                hb.tick();
             }
 
             // Check for termination: a lone dot followed by CRLF
@@ -1672,8 +1747,9 @@ fn build_tls_config(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     if let Some(fp_hex) = trusted_fingerprint {
-        let expected = parse_fingerprint(fp_hex)
-            .ok_or_else(|| NntpError::Connection(format!("invalid trusted_fingerprint: {fp_hex}")))?;
+        let expected = parse_fingerprint(fp_hex).ok_or_else(|| {
+            NntpError::Connection(format!("invalid trusted_fingerprint: {fp_hex}"))
+        })?;
         let verifier = Arc::new(FingerprintVerifier { expected });
         let config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -1707,7 +1783,10 @@ fn build_tls_config(
 
 /// Parse a hex SHA-256 fingerprint (optional colons, any case) into 32 bytes.
 fn parse_fingerprint(s: &str) -> Option<[u8; 32]> {
-    let cleaned: String = s.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .collect();
     if cleaned.len() != 64 {
         return None;
     }
@@ -2288,6 +2367,78 @@ mod tests {
         let body = String::from_utf8_lossy(&data);
         assert!(body.contains("Body content here"));
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_io_heartbeat_ticks_on_every_read() {
+        // Verify the socket-liveness heartbeat advances on each NNTP response
+        // line — this is the signal nzb-web's idle watchdog uses to distinguish
+        // slow-but-alive connections from zombied ones. Without this, workers
+        // fetching a single slow article would appear dead for the full fetch
+        // duration and get false-evicted (the exact production bug this fixes).
+        let mut articles = HashMap::new();
+        articles.insert("hb@test".into(), b"x".repeat(16_384)); // multi-line body
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+
+        let epoch = Instant::now();
+        let heartbeat = Arc::new(AtomicU64::new(0));
+
+        // Ensure epoch.elapsed().as_millis() is > 0 by the time the first
+        // read ticks the heartbeat — otherwise a localhost connect faster
+        // than 1ms would tick `0` and we couldn't distinguish from unset.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut conn = NntpConnection::new("test".into());
+        conn.set_io_heartbeat(heartbeat.clone(), epoch);
+        conn.connect(&config).await.unwrap();
+
+        // The connect sequence (welcome + any auth responses) must have
+        // advanced the heartbeat at least once.
+        let after_connect = heartbeat.load(Ordering::Relaxed);
+        assert!(
+            after_connect > 0,
+            "heartbeat should tick during connect (welcome banner read); got {after_connect}"
+        );
+
+        // Briefly sleep so elapsed millis advance between reads — otherwise
+        // a fast mock reply could tick within the same ms.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        conn.fetch_body("hb@test").await.unwrap();
+
+        let after_fetch = heartbeat.load(Ordering::Relaxed);
+        assert!(
+            after_fetch > after_connect,
+            "heartbeat should advance during multi-line body read \
+             (before={after_connect}ms, after={after_fetch}ms)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_io_heartbeat_optional_noop_when_unset() {
+        // Connections without a heartbeat installed must still work identically
+        // to pre-patch behaviour. Guards against regression for consumers that
+        // don't opt into the liveness signal.
+        let mut articles = HashMap::new();
+        articles.insert("noop@test".into(), b"payload".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        // No set_io_heartbeat call.
+        conn.connect(&config).await.unwrap();
+        let response = conn.fetch_body("noop@test").await.unwrap();
+        assert_eq!(response.code, 222);
     }
 
     #[tokio::test]
