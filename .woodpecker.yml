@@ -54,21 +54,10 @@ steps:
       - event: push
         branch: main
 
-  - name: trigger-renovate
-    image: alpine/curl
-    environment:
-      WOODPECKER_TOKEN:
-        from_secret: woodpecker_token
-    commands:
-      - |
-        curl -sf -X POST \
-          "https://ci.indexarr.net/api/repos/indexarr/renovate/pipelines" \
-          -H "Authorization: Bearer $WOODPECKER_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d '{"branch":"main"}'
-    when:
-      - event: push
-        branch: main
+  # trigger-renovate step removed — `woodpecker_token` secret isn't
+  # configured, which puts the whole pipeline into ERROR state at
+  # secret-validation time (before any step runs). Publishing to Forgejo
+  # still happens. Re-add once the token is provisioned.
 
   - name: push-github
     image: alpine/git
@@ -95,7 +84,7 @@ steps:
       - |
         curl -s -X POST "$DISCORD_WEBHOOK_URL" \
           -H "Content-Type: application/json" \
-          -d "{\"embeds\":[{\"title\":\"nzb-nntp published\",\"description\":\"Published to Forgejo registry. Renovate scan triggered.\",\"color\":3066993}]}"
+          -d "{\"embeds\":[{\"title\":\"nzb-nntp published\",\"description\":\"Published to Forgejo registry.\",\"color\":3066993}]}"
     when:
       - event: push
         branch: main
