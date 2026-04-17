@@ -287,6 +287,14 @@ impl NntpConnection {
         &self.capabilities
     }
 
+    /// Test-only: override the cached capabilities. Used by the test suite to
+    /// exercise capability-gated branches (e.g. the BODY → ARTICLE fallback)
+    /// without inventing unrealistic mock-server responses.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_capabilities_for_test(&mut self, caps: NntpCapabilities) {
+        self.capabilities = caps;
+    }
+
     /// Attach a socket-liveness heartbeat. Every successful line read from
     /// the socket will store `epoch.elapsed().as_millis() as u64` in
     /// `timestamp_ms`. Callers (e.g. nzb-web's idle-worker watchdog) compare
@@ -495,11 +503,13 @@ impl NntpConnection {
         let mode_ms = t_mode_start.elapsed().as_millis() as u64;
 
         // 6. Negotiate compression if configured
+        let t_compress_start = std::time::Instant::now();
         if config.compress
             && let Err(e) = self.negotiate_compression().await
         {
             debug!(server = %self.server_id, error = %e, "Compression negotiation failed, continuing without");
         }
+        let compress_ms = t_compress_start.elapsed().as_millis() as u64;
 
         info!(
             server = %self.server_id,
@@ -508,6 +518,7 @@ impl NntpConnection {
             auth_ms,
             caps_ms,
             mode_ms,
+            compress_ms,
             probed = self.capabilities.probed,
             "nntp_connect"
         );
@@ -697,7 +708,27 @@ impl NntpConnection {
         match resp.code {
             101 => {
                 let body = self.read_multiline_body().await?;
-                let caps = NntpCapabilities::parse(&body);
+                let mut caps = NntpCapabilities::parse(&body);
+                // Defensive: a probed response that yields zero usable
+                // content-command flags would silently break BODY/STAT for
+                // every caller. Real RFC 3977 servers always advertise either
+                // READER or one of OVER/HDR/POST/IHAVE, so an empty result
+                // here almost certainly means a non-compliant or stripped
+                // capability list rather than a true transit-only server.
+                // Treat as "unknown" and fall back to permissive defaults
+                // (preserves pre-3977 client behaviour) while keeping the
+                // parsed metadata (version/implementation/list_keywords) so
+                // ops still see what the server reported.
+                if !caps.have_body && !caps.have_stat && !caps.have_article && !caps.have_head {
+                    debug!(
+                        server = %self.server_id,
+                        "CAPABILITIES probed but no reader-mode flags advertised — assuming defaults"
+                    );
+                    caps.have_article = true;
+                    caps.have_body = true;
+                    caps.have_head = true;
+                    caps.have_stat = true;
+                }
                 info!(
                     server = %self.server_id,
                     reader = caps.reader,
@@ -729,6 +760,12 @@ impl NntpConnection {
     /// IHAVE/transit commands at connect, and you must switch modes before
     /// issuing ARTICLE/BODY/HEAD/STAT).
     async fn enter_reader_mode(&mut self) -> NntpResult<()> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot MODE READER in state {:?}",
+                self.state
+            )));
+        }
         debug!(server = %self.server_id, "MODE READER transition");
         self.send_command("MODE READER").await?;
         let resp = self.read_response_line().await?;
@@ -947,12 +984,13 @@ impl NntpConnection {
     /// Sends `STAT <message-id>`. Returns `Ok(response)` with code 223 if
     /// the article exists, or an appropriate error.
     ///
-    /// Returns [`NntpError::Protocol`] if the server's capabilities report
-    /// STAT is unsupported — callers should treat this the same as an
-    /// `ArticleNotFound` for dispatch purposes (i.e. try another server).
+    /// Returns [`NntpError::ArticleNotFound`] if the server's capabilities
+    /// report STAT is unsupported. This lets dispatchers treat capability
+    /// gaps as "this server can't confirm — try another" without flagging
+    /// the connection as broken (which a `Protocol` error would imply).
     pub async fn stat_article(&mut self, message_id: &str) -> NntpResult<NntpResponse> {
         if !self.capabilities.have_stat {
-            return Err(NntpError::Protocol("Server does not support STAT".into()));
+            return Err(NntpError::ArticleNotFound(normalize_message_id(message_id)));
         }
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
@@ -1308,16 +1346,24 @@ impl NntpConnection {
     /// Sends `BODY <message-id>` and returns the raw body data.
     ///
     /// Capability-aware: if the server's advertised capabilities indicate
-    /// BODY is not supported, this automatically falls back to `ARTICLE`
-    /// (which returns headers+blank+body — callers that only want the body
-    /// can strip the header section). Mirrors SABnzbd's `have_body` switch.
+    /// BODY is not supported but ARTICLE is, this transparently issues
+    /// `ARTICLE <message-id>` and strips the header section before returning,
+    /// so the caller always receives body-only data regardless of which
+    /// command was actually used. Mirrors SABnzbd's `have_body` switch.
     pub async fn fetch_body(&mut self, message_id: &str) -> NntpResult<NntpResponse> {
         if !self.capabilities.have_body && self.capabilities.have_article {
             trace!(
                 server = %self.server_id,
-                "Server lacks BODY capability — falling back to ARTICLE"
+                "Server lacks BODY capability — falling back to ARTICLE and stripping headers"
             );
-            return self.fetch_article(message_id).await;
+            let mut resp = self.fetch_article(message_id).await?;
+            if let Some(data) = resp.data.as_mut() {
+                *data = strip_article_headers(data);
+            }
+            // Normalize the status code so callers can't tell which path was
+            // taken — BODY's success code is 222.
+            resp.code = 222;
+            return Ok(resp);
         }
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
@@ -1761,6 +1807,29 @@ fn normalize_message_id(mid: &str) -> String {
     } else {
         format!("<{mid}>")
     }
+}
+
+/// Strip the header section from an ARTICLE response body, returning only the
+/// body bytes. Used by `fetch_body` when the server lacks BODY capability and
+/// we have to fall back to ARTICLE.
+///
+/// RFC 3977 §6.2.1: an ARTICLE response is `headers \r\n \r\n body`. We split
+/// on the first blank line. If no blank line exists (degenerate / header-only
+/// article), returns an empty Vec — matching what BODY would have returned.
+fn strip_article_headers(article: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    while i + 1 < article.len() {
+        // Match either CRLF CRLF or LF LF as the header/body separator.
+        if article[i] == b'\r' && article[i + 1] == b'\n' {
+            if i + 3 < article.len() && article[i + 2] == b'\r' && article[i + 3] == b'\n' {
+                return article[i + 4..].to_vec();
+            }
+        } else if article[i] == b'\n' && article[i + 1] == b'\n' {
+            return article[i + 2..].to_vec();
+        }
+        i += 1;
+    }
+    Vec::new()
 }
 
 /// Parse XOVER multi-line body into structured entries.

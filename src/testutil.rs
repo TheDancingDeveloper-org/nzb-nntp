@@ -140,6 +140,14 @@ pub struct MockConfig {
     /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
     /// attempts within the `window`, all subsequent auths return 481.
     pub auth_rate_limit: Option<AuthRateLimit>,
+    /// If true, respond to `CAPABILITIES` with `500 Unknown command` to
+    /// simulate a pre-RFC-3977 server. Forces the client onto its
+    /// conservative-default code path.
+    pub capabilities_unsupported: bool,
+    /// If true, the `CAPABILITIES` response advertises `MODE-READER`
+    /// instead of `READER`, requiring the client to issue `MODE READER`
+    /// before reader commands work.
+    pub capabilities_mode_reader: bool,
 }
 
 impl Default for MockConfig {
@@ -163,6 +171,8 @@ impl Default for MockConfig {
             response_delay: None,
             article_response_overrides: HashMap::new(),
             auth_rate_limit: None,
+            capabilities_unsupported: false,
+            capabilities_mode_reader: false,
         }
     }
 }
@@ -381,15 +391,24 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             }
 
             "CAPABILITIES" => {
-                mwrite!(conn, b"101 Capability list:\r\n");
-                mwrite!(conn, b"VERSION 2\r\n");
-                mwrite!(conn, b"READER\r\n");
-                mwrite!(conn, b"POST\r\n");
-                mwrite!(conn, b"HDR\r\n");
-                mwrite!(conn, b"OVER MSGID\r\n");
-                mwrite!(conn, b"LIST ACTIVE NEWSGROUPS OVERVIEW.FMT\r\n");
-                mwrite!(conn, b"IMPLEMENTATION nzb-nntp-testutil 1.0\r\n");
-                mwrite!(conn, b".\r\n");
+                if config.capabilities_unsupported {
+                    mwrite!(conn, b"500 Unknown command\r\n");
+                } else {
+                    mwrite!(conn, b"101 Capability list:\r\n");
+                    mwrite!(conn, b"VERSION 2\r\n");
+                    if config.capabilities_mode_reader {
+                        mwrite!(conn, b"MODE-READER\r\n");
+                        mwrite!(conn, b"IHAVE\r\n");
+                    } else {
+                        mwrite!(conn, b"READER\r\n");
+                        mwrite!(conn, b"POST\r\n");
+                        mwrite!(conn, b"HDR\r\n");
+                        mwrite!(conn, b"OVER MSGID\r\n");
+                        mwrite!(conn, b"LIST ACTIVE NEWSGROUPS OVERVIEW.FMT\r\n");
+                    }
+                    mwrite!(conn, b"IMPLEMENTATION nzb-nntp-testutil 1.0\r\n");
+                    mwrite!(conn, b".\r\n");
+                }
             }
 
             "MODE" => {

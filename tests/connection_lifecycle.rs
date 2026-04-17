@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use nzb_nntp::capabilities::NntpCapabilities;
 use nzb_nntp::connection::NntpConnection;
 use nzb_nntp::error::NntpError;
 use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config, test_config_with_auth};
@@ -291,6 +292,123 @@ async fn test_capabilities_probed_on_connect() {
     assert!(caps.over, "mock advertises OVER");
     assert!(caps.over_msgid, "mock advertises OVER MSGID");
     assert_eq!(caps.version.as_deref(), Some("2"));
+
+    conn.quit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_capabilities_unsupported_falls_back_to_defaults() {
+    // Server returns 500 to CAPABILITIES — pre-RFC-3977 behaviour. Client
+    // should fall back to permissive defaults so BODY/STAT remain usable.
+    let server = MockNntpServer::start(MockConfig {
+        capabilities_unsupported: true,
+        ..Default::default()
+    })
+    .await;
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+
+    let caps = conn.capabilities();
+    assert!(!caps.probed, "server rejected CAPABILITIES");
+    assert!(caps.have_body, "defaults must keep BODY available");
+    assert!(caps.have_stat, "defaults must keep STAT available");
+    assert!(caps.have_article);
+    assert!(caps.have_head);
+
+    conn.quit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mode_reader_transition_on_transit_server() {
+    // Server advertises MODE-READER (transit mode); client must issue
+    // MODE READER and the derived flags must reflect reader mode being active.
+    let server = MockNntpServer::start(MockConfig {
+        capabilities_mode_reader: true,
+        ..Default::default()
+    })
+    .await;
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+
+    let caps = conn.capabilities();
+    assert!(caps.probed);
+    assert!(
+        caps.mode_reader_required,
+        "server advertised MODE-READER capability"
+    );
+    assert!(
+        caps.reader,
+        "MODE READER transition should mark reader mode active"
+    );
+    assert!(caps.have_body);
+    assert!(caps.have_stat);
+    assert!(caps.have_article);
+    assert!(caps.have_head);
+
+    conn.quit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_fetch_body_falls_back_to_article_and_strips_headers() {
+    // Real CAPABILITIES responses can't produce have_body=false /
+    // have_article=true, so we drive the fallback by overriding caps directly.
+    // The mock has the article available via ARTICLE; we assert the fallback
+    // returns body-only bytes (headers stripped) under BODY's status code.
+    let mut articles = HashMap::new();
+    let raw_article =
+        b"Subject: hi\r\nFrom: a@b\r\nMessage-ID: <fb1@test>\r\n\r\nBODY-LINE-1\r\nBODY-LINE-2";
+    articles.insert("fb1@test".into(), raw_article.to_vec());
+
+    let server = MockNntpServer::start(MockConfig {
+        articles,
+        ..Default::default()
+    })
+    .await;
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+
+    // Force the capability state we want to exercise: BODY unavailable,
+    // ARTICLE available.
+    let mut caps = NntpCapabilities::default_assumed();
+    caps.have_body = false;
+    caps.have_article = true;
+    conn.set_capabilities_for_test(caps);
+
+    let resp = conn.fetch_body("fb1@test").await.unwrap();
+    assert_eq!(resp.code, 222, "fallback must report BODY's status code");
+    let body = resp.data.expect("body data");
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !text.contains("Subject:"),
+        "headers must be stripped, got: {text:?}"
+    );
+    assert!(text.starts_with("BODY-LINE-1"), "got: {text:?}");
+    assert!(text.contains("BODY-LINE-2"), "got: {text:?}");
+
+    conn.quit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stat_unavailable_returns_article_not_found() {
+    // When the server's caps don't include STAT, callers should see
+    // ArticleNotFound (cheap fail-over) rather than a Protocol error
+    // (which would mark the connection broken).
+    let server = MockNntpServer::start(MockConfig::default()).await;
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+
+    let mut caps = NntpCapabilities::default_assumed();
+    caps.have_stat = false;
+    conn.set_capabilities_for_test(caps);
+
+    match conn.stat_article("xyz@test").await {
+        Err(NntpError::ArticleNotFound(mid)) => assert_eq!(mid, "<xyz@test>"),
+        other => panic!("expected ArticleNotFound, got {other:?}"),
+    }
 
     conn.quit().await.unwrap();
 }
