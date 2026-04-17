@@ -942,9 +942,7 @@ impl NntpConnection {
     /// `ArticleNotFound` for dispatch purposes (i.e. try another server).
     pub async fn stat_article(&mut self, message_id: &str) -> NntpResult<NntpResponse> {
         if !self.capabilities.have_stat {
-            return Err(NntpError::Protocol(
-                "Server does not support STAT".into(),
-            ));
+            return Err(NntpError::Protocol("Server does not support STAT".into()));
         }
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
