@@ -35,6 +35,7 @@ const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 /// each individual line read must complete within this window.
 const READ_BODY_LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
+use crate::capabilities::NntpCapabilities;
 use crate::config::{ListActiveEntry, ServerConfig};
 
 use crate::error::{NntpError, NntpResult};
@@ -256,6 +257,10 @@ pub struct NntpConnection {
     /// evictions of workers that are legitimately mid-article with slow
     /// provider response times.
     io_heartbeat: Option<IoHeartbeat>,
+    /// Capabilities advertised by the server (populated on connect via the
+    /// `CAPABILITIES` command; falls back to conservative defaults if the
+    /// server is pre-RFC-3977 and rejects the command).
+    capabilities: NntpCapabilities,
 }
 
 impl NntpConnection {
@@ -267,7 +272,19 @@ impl NntpConnection {
             transport: None,
             compress_enabled: false,
             io_heartbeat: None,
+            capabilities: NntpCapabilities::default_assumed(),
         }
+    }
+
+    /// Capabilities advertised by this server (populated during `connect()`).
+    ///
+    /// If the server does not implement `CAPABILITIES` (pre-RFC 3977), this
+    /// returns the conservative defaults from [`NntpCapabilities::default_assumed`] —
+    /// which assume BODY/ARTICLE/HEAD/STAT are all available. Check
+    /// [`NntpCapabilities::probed`] to distinguish "server told us" from
+    /// "we assumed".
+    pub fn capabilities(&self) -> &NntpCapabilities {
+        &self.capabilities
     }
 
     /// Attach a socket-liveness heartbeat. Every successful line read from
@@ -446,7 +463,32 @@ impl NntpConnection {
             self.state = ConnectionState::Ready;
         }
 
-        // 5. Negotiate compression if configured
+        // 5. Query server capabilities (RFC 3977 §5.2). If this fails we fall
+        //    back to conservative defaults assuming ARTICLE/BODY/HEAD/STAT are
+        //    all available, matching legacy pre-3977 client behaviour.
+        if let Err(e) = self.query_capabilities().await {
+            debug!(
+                server = %self.server_id,
+                error = %e,
+                "CAPABILITIES query failed — falling back to default feature assumptions"
+            );
+            self.capabilities = NntpCapabilities::default_assumed();
+        }
+
+        // 5b. If the server advertises MODE-READER but not READER, transition
+        //     to reader mode. Post-transition commands (BODY/STAT) require it.
+        if self.capabilities.mode_reader_required
+            && !self.capabilities.reader
+            && let Err(e) = self.enter_reader_mode().await
+        {
+            warn!(
+                server = %self.server_id,
+                error = %e,
+                "MODE READER failed — server may still accept reader commands"
+            );
+        }
+
+        // 6. Negotiate compression if configured
         if config.compress
             && let Err(e) = self.negotiate_compression().await
         {
@@ -617,6 +659,89 @@ impl NntpConnection {
                     resp.code, resp.message
                 )))
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // CAPABILITIES (RFC 3977 §5.2)
+    // ------------------------------------------------------------------
+
+    /// Query the server's CAPABILITIES and store them on the connection.
+    ///
+    /// A compliant RFC 3977 server responds with `101 Capability list:`
+    /// followed by a multi-line body listing each capability. Older servers
+    /// (INN 1.x, Diablo pre-2010) don't implement the command at all and
+    /// respond with `500 Unknown command` — in that case the caller falls
+    /// back to conservative defaults.
+    async fn query_capabilities(&mut self) -> NntpResult<()> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot query CAPABILITIES in state {:?}",
+                self.state
+            )));
+        }
+        debug!(server = %self.server_id, "CAPABILITIES query starting");
+        self.send_command("CAPABILITIES").await?;
+        let resp = self.read_response_line().await?;
+
+        match resp.code {
+            101 => {
+                let body = self.read_multiline_body().await?;
+                let caps = NntpCapabilities::parse(&body);
+                info!(
+                    server = %self.server_id,
+                    reader = caps.reader,
+                    have_body = caps.have_body,
+                    have_stat = caps.have_stat,
+                    have_article = caps.have_article,
+                    hdr = caps.hdr,
+                    over = caps.over,
+                    implementation = caps.implementation.as_deref().unwrap_or("?"),
+                    "NNTP capabilities"
+                );
+                self.capabilities = caps;
+                Ok(())
+            }
+            _ => {
+                debug!(
+                    server = %self.server_id,
+                    code = resp.code,
+                    "CAPABILITIES unsupported — using conservative defaults"
+                );
+                self.capabilities = NntpCapabilities::default_assumed();
+                Ok(())
+            }
+        }
+    }
+
+    /// Transition from transit mode to reader mode. Required by servers that
+    /// advertise `MODE-READER` in their CAPABILITIES list (they expose
+    /// IHAVE/transit commands at connect, and you must switch modes before
+    /// issuing ARTICLE/BODY/HEAD/STAT).
+    async fn enter_reader_mode(&mut self) -> NntpResult<()> {
+        debug!(server = %self.server_id, "MODE READER transition");
+        self.send_command("MODE READER").await?;
+        let resp = self.read_response_line().await?;
+        match resp.code {
+            200 | 201 => {
+                debug!(
+                    server = %self.server_id,
+                    code = resp.code,
+                    "MODE READER accepted"
+                );
+                // After MODE READER, RFC 3977 §5.3 says the full reader
+                // command set is active. Re-derive the feature flags.
+                self.capabilities.reader = true;
+                self.capabilities.have_article = true;
+                self.capabilities.have_body = true;
+                self.capabilities.have_head = true;
+                self.capabilities.have_stat = true;
+                Ok(())
+            }
+            _ => Err(NntpError::Protocol(format!(
+                "Unexpected MODE READER response {}: {}",
+                resp.code, resp.message
+            ))),
         }
     }
 
@@ -811,7 +936,16 @@ impl NntpConnection {
     ///
     /// Sends `STAT <message-id>`. Returns `Ok(response)` with code 223 if
     /// the article exists, or an appropriate error.
+    ///
+    /// Returns [`NntpError::Protocol`] if the server's capabilities report
+    /// STAT is unsupported — callers should treat this the same as an
+    /// `ArticleNotFound` for dispatch purposes (i.e. try another server).
     pub async fn stat_article(&mut self, message_id: &str) -> NntpResult<NntpResponse> {
+        if !self.capabilities.have_stat {
+            return Err(NntpError::Protocol(
+                "Server does not support STAT".into(),
+            ));
+        }
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
                 "Cannot STAT in state {:?}",
@@ -1164,7 +1298,19 @@ impl NntpConnection {
     /// Fetch article body by message-id (headers excluded).
     ///
     /// Sends `BODY <message-id>` and returns the raw body data.
+    ///
+    /// Capability-aware: if the server's advertised capabilities indicate
+    /// BODY is not supported, this automatically falls back to `ARTICLE`
+    /// (which returns headers+blank+body — callers that only want the body
+    /// can strip the header section). Mirrors SABnzbd's `have_body` switch.
     pub async fn fetch_body(&mut self, message_id: &str) -> NntpResult<NntpResponse> {
+        if !self.capabilities.have_body && self.capabilities.have_article {
+            trace!(
+                server = %self.server_id,
+                "Server lacks BODY capability — falling back to ARTICLE"
+            );
+            return self.fetch_article(message_id).await;
+        }
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
                 "Cannot BODY in state {:?}",

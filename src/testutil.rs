@@ -380,6 +380,28 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                 break;
             }
 
+            "CAPABILITIES" => {
+                mwrite!(conn, b"101 Capability list:\r\n");
+                mwrite!(conn, b"VERSION 2\r\n");
+                mwrite!(conn, b"READER\r\n");
+                mwrite!(conn, b"POST\r\n");
+                mwrite!(conn, b"HDR\r\n");
+                mwrite!(conn, b"OVER MSGID\r\n");
+                mwrite!(conn, b"LIST ACTIVE NEWSGROUPS OVERVIEW.FMT\r\n");
+                mwrite!(conn, b"IMPLEMENTATION nzb-nntp-testutil 1.0\r\n");
+                mwrite!(conn, b".\r\n");
+            }
+
+            "MODE" => {
+                let sub = parts.get(1).map(|s| s.to_uppercase()).unwrap_or_default();
+                if sub == "READER" {
+                    mwrite!(conn, b"200 Reader mode, posting allowed\r\n");
+                } else {
+                    let resp = format!("501 Unknown MODE subcommand: {}\r\n", sub);
+                    mwrite!(conn, resp.as_bytes());
+                }
+            }
+
             "AUTHINFO" => {
                 let sub = parts.get(1).map(|s| s.to_uppercase()).unwrap_or_default();
                 match sub.as_str() {

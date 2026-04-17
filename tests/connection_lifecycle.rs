@@ -268,3 +268,29 @@ async fn test_article_with_dot_stuffing() {
 
     conn.quit().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// CAPABILITIES (RFC 3977 §5.2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_capabilities_probed_on_connect() {
+    let server = MockNntpServer::start(MockConfig::default()).await;
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+
+    let caps = conn.capabilities();
+    assert!(caps.probed, "CAPABILITIES should have been probed");
+    assert!(caps.reader, "mock server advertises READER");
+    assert!(caps.have_body);
+    assert!(caps.have_stat);
+    assert!(caps.have_article);
+    assert!(caps.have_head);
+    assert!(caps.hdr, "mock advertises HDR");
+    assert!(caps.over, "mock advertises OVER");
+    assert!(caps.over_msgid, "mock advertises OVER MSGID");
+    assert_eq!(caps.version.as_deref(), Some("2"));
+
+    conn.quit().await.unwrap();
+}

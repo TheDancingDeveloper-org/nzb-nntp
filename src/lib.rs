@@ -9,6 +9,7 @@
 //! - `server` ��� Server health tracking, penalties, speed measurement
 //! - `downloader` — Download orchestrator (assigns articles to servers with failover)
 
+pub mod capabilities;
 pub mod config;
 pub mod connect_gate;
 pub mod connection;
@@ -22,6 +23,7 @@ pub mod server;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testutil;
 
+pub use capabilities::NntpCapabilities;
 pub use config::{Article, ListActiveEntry, ServerConfig};
 pub use connection::{
     ArticleRange, ConnectionState, GroupResponse, HeaderEntry, NntpConnection, NntpResponse,
