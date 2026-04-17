@@ -457,15 +457,18 @@ impl NntpConnection {
         }
 
         // 4. Authenticate if credentials are provided
+        let t_auth_start = std::time::Instant::now();
         if config.username.is_some() {
             self.authenticate(config).await?;
         } else {
             self.state = ConnectionState::Ready;
         }
+        let auth_ms = t_auth_start.elapsed().as_millis() as u64;
 
         // 5. Query server capabilities (RFC 3977 §5.2). If this fails we fall
         //    back to conservative defaults assuming ARTICLE/BODY/HEAD/STAT are
         //    all available, matching legacy pre-3977 client behaviour.
+        let t_caps_start = std::time::Instant::now();
         if let Err(e) = self.query_capabilities().await {
             debug!(
                 server = %self.server_id,
@@ -474,9 +477,11 @@ impl NntpConnection {
             );
             self.capabilities = NntpCapabilities::default_assumed();
         }
+        let caps_ms = t_caps_start.elapsed().as_millis() as u64;
 
         // 5b. If the server advertises MODE-READER but not READER, transition
         //     to reader mode. Post-transition commands (BODY/STAT) require it.
+        let t_mode_start = std::time::Instant::now();
         if self.capabilities.mode_reader_required
             && !self.capabilities.reader
             && let Err(e) = self.enter_reader_mode().await
@@ -487,6 +492,7 @@ impl NntpConnection {
                 "MODE READER failed — server may still accept reader commands"
             );
         }
+        let mode_ms = t_mode_start.elapsed().as_millis() as u64;
 
         // 6. Negotiate compression if configured
         if config.compress
@@ -499,6 +505,10 @@ impl NntpConnection {
             server = %self.server_id,
             compress = self.compress_enabled,
             connect_ms = t_connect.elapsed().as_millis() as u64,
+            auth_ms,
+            caps_ms,
+            mode_ms,
+            probed = self.capabilities.probed,
             "nntp_connect"
         );
         Ok(())
