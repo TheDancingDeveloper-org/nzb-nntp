@@ -1,6 +1,6 @@
 [package]
 name = "nzb-nntp"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2024"
 description = "Async NNTP client with TLS, pipelining, connection pooling, and multi-server support"
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 bytes = "1"
 tracing = "0.1"
