@@ -28,6 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -184,6 +185,7 @@ impl Default for MockConfig {
 /// An in-process mock NNTP server for testing.
 pub struct MockNntpServer {
     pub addr: SocketAddr,
+    connection_count: Arc<AtomicUsize>,
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
@@ -193,13 +195,16 @@ impl MockNntpServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(config);
+        let connection_count = Arc::new(AtomicUsize::new(0));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+        let accept_count = Arc::clone(&connection_count);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     result = listener.accept() => {
                         if let Ok((stream, _)) = result {
+                            accept_count.fetch_add(1, Ordering::Relaxed);
                             let cfg = config.clone();
                             tokio::spawn(handle_connection(stream, cfg));
                         }
@@ -211,6 +216,7 @@ impl MockNntpServer {
 
         Self {
             addr,
+            connection_count,
             _shutdown: shutdown_tx,
         }
     }
@@ -218,6 +224,11 @@ impl MockNntpServer {
     /// The port the mock server is listening on.
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// Total accepted client connections since the server started.
+    pub fn connection_count(&self) -> usize {
+        self.connection_count.load(Ordering::Relaxed)
     }
 }
 

@@ -6,8 +6,9 @@
 //! - `connection` — Single NNTP connection state machine (TCP/TLS, auth, article fetch)
 //! - `pipeline` — Request pipelining (ARTICLE and STAT commands)
 //! - `pool` — Per-server async connection pool
-//! - `server` ��� Server health tracking, penalties, speed measurement
-//! - `downloader` — Download orchestrator (assigns articles to servers with failover)
+//! - `server` — Server health tracking, penalties, speed measurement
+//! - `downloader` — Sequential/failover download orchestrator using one fresh
+//!   connection per article attempt
 
 pub mod capabilities;
 pub mod config;

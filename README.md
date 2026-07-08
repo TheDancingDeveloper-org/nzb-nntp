@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nzb-nntp = "0.1"
+nzb-nntp = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -142,7 +142,21 @@ async fn pipelined_download(conn: &mut NntpConnection) -> nzb_nntp::NntpResult<(
 
 ### Multi-Server Downloading
 
-The `Downloader` coordinates article fetching across multiple servers with automatic failover:
+The `Downloader` is the crate's simple sequential failover path. It processes
+one pending article at a time and opens a fresh connection for each attempt.
+That keeps the behavior predictable, but it does not use the configured
+connection count for throughput scaling by itself.
+
+For high-throughput consumers, use `ConnectionPool` + `Pipeline` directly or a
+higher-level engine such as `nzb-news`. Use `Downloader` when you want the
+simple reference behavior and server-priority failover.
+
+```text
+Simple/failover path:  Downloader
+High-throughput path:  ConnectionPool + Pipeline (or nzb-news)
+```
+
+Example `Downloader` usage:
 
 ```rust
 use nzb_nntp::{Article, Downloader, ServerConfig};
