@@ -31,6 +31,7 @@ pub struct ServerConfig {
     /// Article retention in days (0 = unlimited)
     pub retention: u32,
     /// Number of pipelined requests per connection
+    #[serde(default = "default_pipelining")]
     pub pipelining: u8,
     /// Server is optional (failure is non-fatal)
     pub optional: bool,
@@ -39,7 +40,7 @@ pub struct ServerConfig {
     pub compress: bool,
     /// Delay in milliseconds between opening new connections (0 = no delay).
     /// Prevents connection bursts that trigger server-side rate limiting.
-    #[serde(default)]
+    #[serde(default = "default_ramp_up_delay_ms")]
     pub ramp_up_delay_ms: u32,
     /// TCP receive buffer size in bytes (SO_RCVBUF). 0 = OS default.
     #[serde(default = "default_recv_buffer_size")]
@@ -53,11 +54,30 @@ pub struct ServerConfig {
     /// Use this to pin self-signed certs for a bundled client binary.
     #[serde(default)]
     pub trusted_fingerprint: Option<String>,
+    /// Seconds to wait for a connection (TCP + TLS + welcome banner + auth)
+    /// to this server before giving up and treating it as unreachable.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u32,
 }
 
 /// Default TCP receive buffer: 2 MiB.
 fn default_recv_buffer_size() -> u32 {
     2 * 1024 * 1024
+}
+
+/// Default delay between opening NNTP connections: 50ms.
+fn default_ramp_up_delay_ms() -> u32 {
+    50
+}
+
+/// Default connection timeout: 30s.
+fn default_connect_timeout_secs() -> u32 {
+    30
+}
+
+/// Default number of in-flight ARTICLE requests per connection.
+fn default_pipelining() -> u8 {
+    4
 }
 
 impl ServerConfig {
@@ -86,13 +106,14 @@ impl Default for ServerConfig {
             priority: 0,
             enabled: true,
             retention: 0,
-            pipelining: 1,
+            pipelining: default_pipelining(),
             optional: false,
             compress: false,
-            ramp_up_delay_ms: 250,
+            ramp_up_delay_ms: default_ramp_up_delay_ms(),
             recv_buffer_size: default_recv_buffer_size(),
             proxy_url: None,
             trusted_fingerprint: None,
+            connect_timeout_secs: default_connect_timeout_secs(),
         }
     }
 }
@@ -189,6 +210,7 @@ mod tests {
             recv_buffer_size: 2 * 1024 * 1024,
             proxy_url: Some("socks5://proxy:1080".to_string()),
             trusted_fingerprint: None,
+            connect_timeout_secs: 30,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -220,11 +242,40 @@ mod tests {
         assert_eq!(config.priority, 0);
         assert!(config.enabled);
         assert_eq!(config.retention, 0);
-        assert_eq!(config.pipelining, 1);
+        assert_eq!(config.pipelining, 4);
         assert!(!config.optional);
         assert!(!config.compress);
-        assert_eq!(config.ramp_up_delay_ms, 250);
+        assert_eq!(config.ramp_up_delay_ms, 50);
         assert!(config.proxy_url.is_none());
+        assert_eq!(config.connect_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_server_config_missing_ramp_up_uses_default() {
+        let serialized = toml::to_string(&ServerConfig::default()).unwrap();
+        let without_ramp_up = serialized
+            .lines()
+            .filter(|line| !line.starts_with("ramp_up_delay_ms ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config: ServerConfig = toml::from_str(&without_ramp_up).unwrap();
+
+        assert_eq!(config.ramp_up_delay_ms, 50);
+    }
+
+    #[test]
+    fn test_server_config_missing_pipelining_uses_default() {
+        let serialized = toml::to_string(&ServerConfig::default()).unwrap();
+        let without_pipelining = serialized
+            .lines()
+            .filter(|line| !line.starts_with("pipelining ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config: ServerConfig = toml::from_str(&without_pipelining).unwrap();
+
+        assert_eq!(config.pipelining, 4);
     }
 
     #[test]

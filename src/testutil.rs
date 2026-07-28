@@ -28,7 +28,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -36,6 +35,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
+
+pub type ArticleResponseSequences = Arc<Mutex<HashMap<String, VecDeque<(u16, String)>>>>;
 
 // ---------------------------------------------------------------------------
 // Auth rate limiter (cross-connection state)
@@ -117,6 +118,11 @@ pub struct MockConfig {
     pub xpat_entries: Vec<String>,
     /// LIST ACTIVE entries as pre-formatted `groupname last first status` lines.
     pub list_active_entries: Vec<String>,
+    /// If true, `POST` returns 440 instead of accepting an article body.
+    pub post_not_permitted: bool,
+    /// Captured raw articles received via `POST`, after un-dot-stuffing and
+    /// normalizing line endings to CRLF.
+    pub posted_articles: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
 
     // ---- Fault injection (test-support feature) ----
     /// Close the socket silently after writing this many total bytes. The
@@ -138,6 +144,11 @@ pub struct MockConfig {
     /// body. Use to inject 430 (not found), 502 (server down), 403
     /// (forbidden) etc. for individual articles.
     pub article_response_overrides: HashMap<String, u16>,
+    /// Shared one-shot responses for ARTICLE requests. Each request pops the
+    /// next `(code, message)` for its message-id; once exhausted, normal
+    /// article lookup resumes. This models a stale session returning `400`
+    /// followed by a successful fetch on a replacement connection.
+    pub article_response_sequences: Option<ArticleResponseSequences>,
     /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
     /// attempts within the `window`, all subsequent auths return 481.
     pub auth_rate_limit: Option<AuthRateLimit>,
@@ -166,11 +177,14 @@ impl Default for MockConfig {
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
             list_active_entries: Vec::new(),
+            post_not_permitted: false,
+            posted_articles: None,
             silent_close_after_bytes: None,
             hang_after_command: None,
             close_after_n_commands: None,
             response_delay: None,
             article_response_overrides: HashMap::new(),
+            article_response_sequences: None,
             auth_rate_limit: None,
             capabilities_unsupported: false,
             capabilities_mode_reader: false,
@@ -185,26 +199,27 @@ impl Default for MockConfig {
 /// An in-process mock NNTP server for testing.
 pub struct MockNntpServer {
     pub addr: SocketAddr,
-    connection_count: Arc<AtomicUsize>,
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl MockNntpServer {
     /// Start the mock server on a random port.
     pub async fn start(config: MockConfig) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1:0", config).await
+    }
+
+    /// Start the mock server on the provided listen address.
+    pub async fn start_on(bind_addr: &str, config: MockConfig) -> Self {
+        let listener = TcpListener::bind(bind_addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(config);
-        let connection_count = Arc::new(AtomicUsize::new(0));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let accept_count = Arc::clone(&connection_count);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     result = listener.accept() => {
                         if let Ok((stream, _)) = result {
-                            accept_count.fetch_add(1, Ordering::Relaxed);
                             let cfg = config.clone();
                             tokio::spawn(handle_connection(stream, cfg));
                         }
@@ -216,7 +231,6 @@ impl MockNntpServer {
 
         Self {
             addr,
-            connection_count,
             _shutdown: shutdown_tx,
         }
     }
@@ -224,11 +238,6 @@ impl MockNntpServer {
     /// The port the mock server is listening on.
     pub fn port(&self) -> u16 {
         self.addr.port()
-    }
-
-    /// Total accepted client connections since the server started.
-    pub fn connection_count(&self) -> usize {
-        self.connection_count.load(Ordering::Relaxed)
     }
 }
 
@@ -258,6 +267,7 @@ pub fn test_config(port: u16) -> ServerConfig {
         recv_buffer_size: 0,
         proxy_url: None,
         trusted_fingerprint: None,
+        connect_timeout_secs: 30,
     }
 }
 
@@ -427,7 +437,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                 if sub == "READER" {
                     mwrite!(conn, b"200 Reader mode, posting allowed\r\n");
                 } else {
-                    let resp = format!("501 Unknown MODE subcommand: {}\r\n", sub);
+                    let resp = format!("501 Unknown MODE subcommand: {sub}\r\n");
                     mwrite!(conn, resp.as_bytes());
                 }
             }
@@ -481,7 +491,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                     let name = parts.get(1).unwrap_or(&"");
                     if let Some(&(count, first, last)) = config.groups.get(*name) {
                         selected_group = Some(name.to_string());
-                        let resp = format!("211 {} {} {} {}\r\n", count, first, last, name);
+                        let resp = format!("211 {count} {first} {last} {name}\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else {
                         mwrite!(conn, b"411 No such group\r\n");
@@ -560,17 +570,24 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if let Some(&code) = config.article_response_overrides.get(mid) {
-                        let resp = format!("{} <{}>\r\n", code, mid);
+                    let sequenced = config
+                        .article_response_sequences
+                        .as_ref()
+                        .and_then(|state| state.lock().get_mut(mid).and_then(VecDeque::pop_front));
+                    if let Some((code, message)) = sequenced {
+                        let resp = format!("{code} {message}\r\n");
+                        mwrite!(conn, resp.as_bytes());
+                    } else if let Some(&code) = config.article_response_overrides.get(mid) {
+                        let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else if let Some(data) = config.articles.get(mid) {
-                        let header = format!("220 0 <{}>\r\n", mid);
+                        let header = format!("220 0 <{mid}>\r\n");
                         mwrite!(conn, header.as_bytes());
                         if !write_multiline_body(&mut conn, data).await {
                             return;
                         }
                     } else {
-                        let resp = format!("430 No article: <{}>\r\n", mid);
+                        let resp = format!("430 No article: <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     }
                 }
@@ -585,16 +602,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
                     if let Some(&code) = config.article_response_overrides.get(mid) {
-                        let resp = format!("{} <{}>\r\n", code, mid);
+                        let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else if let Some(data) = config.articles.get(mid) {
-                        let header = format!("222 0 <{}>\r\n", mid);
+                        let header = format!("222 0 <{mid}>\r\n");
                         mwrite!(conn, header.as_bytes());
                         if !write_multiline_body(&mut conn, data).await {
                             return;
                         }
                     } else {
-                        let resp = format!("430 No article: <{}>\r\n", mid);
+                        let resp = format!("430 No article: <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     }
                 }
@@ -609,20 +626,39 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
                     if let Some(&code) = config.article_response_overrides.get(mid) {
-                        let resp = format!("{} <{}>\r\n", code, mid);
+                        let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else if config.articles.contains_key(mid) {
-                        let resp = format!("223 0 <{}>\r\n", mid);
+                        let resp = format!("223 0 <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else {
-                        let resp = format!("430 No article: <{}>\r\n", mid);
+                        let resp = format!("430 No article: <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     }
                 }
             }
 
+            "POST" => {
+                if !authenticated {
+                    mwrite!(conn, b"480 Authentication required\r\n");
+                } else if config.post_not_permitted {
+                    mwrite!(conn, b"440 Posting not permitted\r\n");
+                } else {
+                    mwrite!(conn, b"340 Send article to be posted\r\n");
+                    conn.flush().await;
+
+                    let Some(article) = read_posted_article(conn.stream).await else {
+                        return;
+                    };
+                    if let Some(captured) = &config.posted_articles {
+                        captured.lock().push(article);
+                    }
+                    mwrite!(conn, b"240 Article received OK\r\n");
+                }
+            }
+
             _ => {
-                let resp = format!("500 Unknown command: {}\r\n", cmd);
+                let resp = format!("500 Unknown command: {cmd}\r\n");
                 mwrite!(conn, resp.as_bytes());
             }
         }
@@ -687,4 +723,37 @@ async fn write_multiline_body(conn: &mut ConnState<'_>, data: &[u8]) -> bool {
     }
     conn.flush().await;
     true
+}
+
+async fn read_posted_article(stream: &mut BufReader<tokio::net::TcpStream>) -> Option<Vec<u8>> {
+    let mut article = Vec::new();
+
+    loop {
+        let mut line = Vec::new();
+        match stream.read_until(b'\n', &mut line).await {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+
+        if line.ends_with(b"\n") {
+            line.pop();
+        }
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+
+        if line == b"." {
+            break;
+        }
+
+        if line.starts_with(b"..") {
+            article.extend_from_slice(&line[1..]);
+        } else {
+            article.extend_from_slice(&line);
+        }
+        article.extend_from_slice(b"\r\n");
+    }
+
+    Some(article)
 }
