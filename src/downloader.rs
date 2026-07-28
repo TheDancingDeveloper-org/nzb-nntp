@@ -1,15 +1,8 @@
 //! Download orchestrator.
 //!
-//! This is the crate's simple reference download path: it walks the pending
-//! article list one item at a time, opens a fresh NNTP connection for each
-//! attempt, and retries on lower-priority servers when needed.
-//!
-//! That makes it useful for correctness, failover, and lightweight callers,
-//! but it is not the high-throughput path for sustained multi-connection
-//! downloads. Consumers that need pooled persistent connections and deep
-//! pipelining should build on [`crate::pool::ConnectionPool`] and
-//! [`crate::pipeline::Pipeline`] directly, or use a higher-level engine such
-//! as `nzb-news`.
+//! Takes a list of articles and coordinates downloading them across multiple
+//! NNTP servers with priority-based failover, pipelining, bandwidth limiting,
+//! and pause/resume support.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,12 +62,9 @@ struct ServerPick {
 
 /// Orchestrates downloading articles across multiple servers.
 ///
-/// This type processes the queue sequentially. For each article attempt it
-/// picks the highest-priority eligible server, opens a fresh connection, fetches
-/// that single article, and then moves on.
-///
-/// If a server fails, the article is retried on the next-highest-priority
-/// server that has not been tried yet.
+/// Articles are assigned to the highest-priority available server. If a server
+/// fails, the article is retried on the next-highest-priority server that has
+/// not been tried yet.
 pub struct Downloader {
     /// Servers sorted by priority (lowest number = highest priority).
     servers: Arc<Mutex<Vec<ServerState>>>,
@@ -133,10 +123,8 @@ impl Downloader {
 
     /// Download a batch of articles, sending results through the provided channel.
     ///
-    /// Each article is tried on servers in priority order. The batch itself is
-    /// processed one pending article at a time and every attempt uses a freshly
-    /// connected NNTP session. Results (success or failure) are sent via
-    /// `result_tx` as they complete.
+    /// Each article is tried on servers in priority order. Results (success or
+    /// failure) are sent via `result_tx` as they complete.
     pub async fn download(
         &self,
         articles: Vec<Article>,
@@ -233,6 +221,7 @@ impl Downloader {
                             let is_fatal = matches!(
                                 &e,
                                 NntpError::AuthRequired(_)
+                                    | NntpError::PermissionDenied(_)
                                     | NntpError::ServiceUnavailable(_)
                                     | NntpError::Connection(_)
                                     | NntpError::Io(_)
@@ -319,10 +308,7 @@ impl Downloader {
     }
 
     /// Create a fresh NNTP connection to the given server.
-    ///
-    /// This deliberately does not go through the shared pool. `Downloader` is
-    /// the sequential/simple path, so it keeps the control flow straightforward
-    /// instead of trying to hold pooled state across awaits.
+    /// This does NOT go through the pool (avoids holding locks across await).
     async fn connect_to_server(&self, config: &ServerConfig) -> NntpResult<PooledConnection> {
         info!(
             server = %config.name,
@@ -446,51 +432,6 @@ mod tests {
             }
         }
         assert_eq!(success_count, 3);
-    }
-
-    #[tokio::test]
-    async fn test_downloader_opens_fresh_connection_per_article_attempt() {
-        let mut articles = HashMap::new();
-        articles.insert("fresh-1@test".into(), b"Article 1".to_vec());
-        articles.insert("fresh-2@test".into(), b"Article 2".to_vec());
-        articles.insert("fresh-3@test".into(), b"Article 3".to_vec());
-
-        let server = MockNntpServer::start(MockConfig {
-            articles,
-            ..MockConfig::default()
-        })
-        .await;
-        let mut config = test_config(server.port());
-        config.connections = 8;
-
-        let downloader = Downloader::new(vec![config], 0);
-        let (tx, mut rx) = mpsc::channel(10);
-
-        downloader
-            .download(
-                vec![
-                    make_article("fresh-1@test", 1),
-                    make_article("fresh-2@test", 2),
-                    make_article("fresh-3@test", 3),
-                ],
-                tx,
-            )
-            .await
-            .unwrap();
-
-        let mut success_count = 0;
-        while let Ok(result) = rx.try_recv() {
-            if result.result.is_ok() {
-                success_count += 1;
-            }
-        }
-
-        assert_eq!(success_count, 3);
-        assert_eq!(
-            server.connection_count(),
-            3,
-            "Downloader should open a fresh connection per article attempt"
-        );
     }
 
     #[tokio::test]

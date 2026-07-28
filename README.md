@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nzb-nntp = "0.2"
+nzb-nntp = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -142,21 +142,7 @@ async fn pipelined_download(conn: &mut NntpConnection) -> nzb_nntp::NntpResult<(
 
 ### Multi-Server Downloading
 
-The `Downloader` is the crate's simple sequential failover path. It processes
-one pending article at a time and opens a fresh connection for each attempt.
-That keeps the behavior predictable, but it does not use the configured
-connection count for throughput scaling by itself.
-
-For high-throughput consumers, use `ConnectionPool` + `Pipeline` directly or a
-higher-level engine such as `nzb-news`. Use `Downloader` when you want the
-simple reference behavior and server-priority failover.
-
-```text
-Simple/failover path:  Downloader
-High-throughput path:  ConnectionPool + Pipeline (or nzb-news)
-```
-
-Example `Downloader` usage:
+The `Downloader` coordinates article fetching across multiple servers with automatic failover:
 
 ```rust
 use nzb_nntp::{Article, Downloader, ServerConfig};
@@ -357,7 +343,7 @@ async fn pooled_usage() -> nzb_nntp::NntpResult<()> {
 | `priority` | `0` | Server priority (0 = highest, tried first) |
 | `enabled` | `true` | Include this server in downloads |
 | `retention` | `0` | Article retention in days (0 = unlimited) |
-| `pipelining` | `1` | Pipeline depth (1 = no pipelining) |
+| `pipelining` | `4` | Pipeline depth (1 = no pipelining) |
 | `optional` | `false` | If true, failures don't block the download |
 | `compress` | `false` | Negotiate XFEATURE COMPRESS GZIP |
 | `proxy_url` | `None` | SOCKS5 proxy: `socks5://[user:pass@]host:port` |

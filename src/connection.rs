@@ -261,7 +261,28 @@ pub struct NntpConnection {
     /// `CAPABILITIES` command; falls back to conservative defaults if the
     /// server is pre-RFC-3977 and rejects the command).
     capabilities: NntpCapabilities,
+    /// Persistent per-line scratch buffer for `read_multiline_body`, reused
+    /// across calls (cleared, not reallocated) to avoid a fresh heap
+    /// allocation on every article. Never handed out to callers.
+    line_scratch: Vec<u8>,
+    /// Free list of article-body buffers. `read_multiline_body` checks one
+    /// out instead of allocating fresh; hot-path callers that finish with
+    /// the data immediately (`fetch_article`, `Pipeline::receive_one`) check
+    /// it back in via `release_body_buffer`. This is what actually avoids
+    /// the per-article page-fault/allocation cost identified by profiling —
+    /// see `docs/PERFORMANCE_STATUS.md`.
+    body_pool: Vec<Vec<u8>>,
 }
+
+/// Article bodies are typically well under 1 MiB (yEnc articles are usually
+/// ~700-750 KiB encoded); this is the capacity a fresh pooled buffer starts
+/// with so steady-state reuse rarely needs to grow.
+const BODY_BUFFER_CAPACITY: usize = 896 * 1024;
+/// Do not retain buffers that grew well beyond the normal article size.
+const BODY_BUFFER_MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
+/// Cap on how many idle buffers a connection retains, so a burst of
+/// unusually large articles can't pin unbounded memory in the free list.
+const BODY_POOL_MAX_IDLE: usize = 8;
 
 impl NntpConnection {
     /// Create a new, disconnected connection for the given server.
@@ -273,6 +294,29 @@ impl NntpConnection {
             compress_enabled: false,
             io_heartbeat: None,
             capabilities: NntpCapabilities::default_assumed(),
+            line_scratch: Vec::with_capacity(16 * 1024),
+            body_pool: Vec::new(),
+        }
+    }
+
+    /// Check out a reusable article-body buffer, or allocate a fresh one if
+    /// the free list is empty. Callers that finish with the buffer promptly
+    /// should return it via [`Self::release_body_buffer`].
+    pub fn checkout_body_buffer(&mut self) -> Vec<u8> {
+        self.body_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(BODY_BUFFER_CAPACITY))
+    }
+
+    /// Return a body buffer to the free list for reuse. Safe to call for any
+    /// buffer, pooled or not; oversized or excess buffers are dropped
+    /// normally rather than retained.
+    pub fn release_body_buffer(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        if buf.capacity() <= BODY_BUFFER_MAX_RETAINED_CAPACITY
+            && self.body_pool.len() < BODY_POOL_MAX_IDLE
+        {
+            self.body_pool.push(buf);
         }
     }
 
@@ -343,8 +387,26 @@ impl NntpConnection {
     /// Connect to the NNTP server described by `config`.
     ///
     /// This performs TCP connection, optional TLS upgrade, reads the welcome
-    /// banner, and authenticates if credentials are configured.
+    /// banner, and authenticates if credentials are configured. The whole
+    /// sequence is bounded by `config.connect_timeout_secs` — a server that's
+    /// unreachable (firewalled, dead host) would otherwise hang on the TCP
+    /// handshake for the OS-level default (minutes), which stalls failover
+    /// to the next-priority server.
     pub async fn connect(&mut self, config: &ServerConfig) -> NntpResult<()> {
+        let budget = Duration::from_secs(config.connect_timeout_secs.max(1) as u64);
+        match tokio::time::timeout(budget, self.connect_inner(config)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Timeout(format!(
+                    "connect to {}:{} did not complete within {}s",
+                    config.host, config.port, config.connect_timeout_secs
+                )))
+            }
+        }
+    }
+
+    async fn connect_inner(&mut self, config: &ServerConfig) -> NntpResult<()> {
         self.state = ConnectionState::Connecting;
         let t_connect = Instant::now();
 
@@ -362,9 +424,6 @@ impl NntpConnection {
             compress = config.compress,
             "NNTP connecting"
         );
-
-        // Rate-limit connection attempts per host to prevent thundering herd
-        let _gate_permit = crate::connect_gate::acquire(&config.host).await;
 
         // 1. TCP connect (optionally through SOCKS5 proxy)
         let tcp = if let Some(proxy_url) = config
@@ -922,6 +981,10 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
             480 => {
                 warn!(
                     server = %self.server_id,
@@ -967,10 +1030,10 @@ impl NntpConnection {
                     "NNTP unexpected ARTICLE response"
                 );
                 self.state = ConnectionState::Error;
-                Err(NntpError::Protocol(format!(
-                    "Unexpected ARTICLE response {}: {}",
-                    status.code, status.message
-                )))
+                Err(crate::error::unexpected_article_response(
+                    status.code,
+                    status.message,
+                ))
             }
         }
     }
@@ -1579,6 +1642,96 @@ impl NntpConnection {
         }
     }
 
+    /// Post a binary article where the body may contain arbitrary bytes (e.g. yEnc).
+    ///
+    /// `article` must be a complete NNTP article: RFC 2822 headers followed by
+    /// a blank line, then the body, all with CRLF line endings. Lines starting
+    /// with `.` are dot-stuffed automatically. The terminating `.\r\n` is added
+    /// by this method.
+    ///
+    /// Returns the server's 240 response on success.
+    pub async fn post_article_bytes(&mut self, article: &[u8]) -> NntpResult<NntpResponse> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot POST in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+
+        self.send_command("POST")
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+
+        match status.code {
+            340 => {
+                let transport = self
+                    .transport
+                    .as_mut()
+                    .ok_or(NntpError::Connection("Not connected".into()))?;
+
+                let mut start = 0usize;
+                while start < article.len() {
+                    let nl_pos = article[start..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map(|p| start + p);
+                    let line_end = nl_pos.unwrap_or(article.len());
+                    let line = article[start..line_end]
+                        .strip_suffix(b"\r")
+                        .unwrap_or(&article[start..line_end]);
+
+                    if line.starts_with(b".") {
+                        transport.write_all(b".").await.map_err(|e| {
+                            self.state = ConnectionState::Error;
+                            NntpError::Io(e)
+                        })?;
+                    }
+                    transport.write_all(line).await.map_err(|e| {
+                        self.state = ConnectionState::Error;
+                        NntpError::Io(e)
+                    })?;
+                    transport.write_all(b"\r\n").await.map_err(|e| {
+                        self.state = ConnectionState::Error;
+                        NntpError::Io(e)
+                    })?;
+
+                    start = match nl_pos {
+                        Some(p) => p + 1,
+                        None => article.len(),
+                    };
+                }
+
+                transport.write_all(b".\r\n").await.map_err(|e| {
+                    self.state = ConnectionState::Error;
+                    NntpError::Io(e)
+                })?;
+
+                let result = self
+                    .read_response_line()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                Ok(result)
+            }
+            440 => {
+                self.state = ConnectionState::Ready;
+                Ok(status)
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected POST response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // QUIT
     // ------------------------------------------------------------------
@@ -1698,6 +1851,20 @@ impl NntpConnection {
     /// Read a multi-line body terminated by `.\r\n`. Un-does dot-stuffing.
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
+        let mut body = self.checkout_body_buffer();
+        self.read_multiline_body_into(&mut body).await?;
+        Ok(body)
+    }
+
+    /// Same as [`Self::read_multiline_body`], but fills a caller-owned
+    /// buffer (cleared first) instead of allocating. `out` is expected to
+    /// have been checked out via [`Self::checkout_body_buffer`] so its
+    /// existing capacity is reused rather than growing from zero — that
+    /// checkout is what actually avoids the page-fault/allocation cost per
+    /// article; passing an arbitrary fresh `Vec::new()` here still works
+    /// correctly, it just forgoes the reuse benefit.
+    async fn read_multiline_body_into(&mut self, out: &mut Vec<u8>) -> NntpResult<()> {
+        out.clear();
         // Clone the heartbeat ref before we take the mutable borrow on
         // `transport`, so we can tick it inside the loop body. Cheap: just
         // an Arc clone plus an Instant copy.
@@ -1707,20 +1874,17 @@ impl NntpConnection {
             .as_mut()
             .ok_or(NntpError::Connection("Not connected".into()))?;
 
-        let mut body = Vec::with_capacity(1024 * 1024);
-        let mut line_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
-
         loop {
-            line_buf.clear();
+            self.line_scratch.clear();
             let n = tokio::time::timeout(
                 READ_BODY_LINE_TIMEOUT,
-                transport.read_line_bytes(&mut line_buf),
+                transport.read_line_bytes(&mut self.line_scratch),
             )
             .await
             .map_err(|_| {
                 warn!(
                     server = %self.server_id,
-                    body_bytes = body.len(),
+                    body_bytes = out.len(),
                     "read_multiline_body timed out after {}s — connection likely dead",
                     READ_BODY_LINE_TIMEOUT.as_secs()
                 );
@@ -1729,7 +1893,7 @@ impl NntpConnection {
                     format!(
                         "read_multiline_body timed out after {}s (received {} bytes so far)",
                         READ_BODY_LINE_TIMEOUT.as_secs(),
-                        body.len()
+                        out.len()
                     ),
                 ))
             })?
@@ -1749,19 +1913,19 @@ impl NntpConnection {
             }
 
             // Check for termination: a lone dot followed by CRLF
-            if line_buf == b".\r\n" || line_buf == b".\n" {
+            if self.line_scratch == b".\r\n" || self.line_scratch == b".\n" {
                 break;
             }
 
             // Dot-unstuffing: if a line starts with "..", remove the first dot
-            if line_buf.starts_with(b"..") {
-                body.extend_from_slice(&line_buf[1..]);
+            if self.line_scratch.starts_with(b"..") {
+                out.extend_from_slice(&self.line_scratch[1..]);
             } else {
-                body.extend_from_slice(&line_buf);
+                out.extend_from_slice(&self.line_scratch);
             }
         }
 
-        Ok(body)
+        Ok(())
     }
 
     /// Returns `true` if the connection has an active transport.
@@ -1775,7 +1939,8 @@ impl NntpConnection {
 // ---------------------------------------------------------------------------
 
 /// Parse a single NNTP response line into code + message.
-fn parse_response_line(line: &str) -> NntpResult<NntpResponse> {
+/// Parse an NNTP status line into a response code and human-readable message.
+pub fn parse_response_line(line: &str) -> NntpResult<NntpResponse> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.len() < 3 {
         return Err(NntpError::Protocol(format!(
@@ -1835,7 +2000,8 @@ fn strip_article_headers(article: &[u8]) -> Vec<u8> {
 /// Parse XOVER multi-line body into structured entries.
 /// Each line is tab-delimited:
 /// article_num \t subject \t from \t date \t message-id \t references \t bytes \t lines
-fn parse_xover_data(data: &[u8]) -> Vec<XoverEntry> {
+/// Parse the multi-line data returned by an XOVER/OVER command.
+pub fn parse_xover_data(data: &[u8]) -> Vec<XoverEntry> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
 
@@ -1865,7 +2031,8 @@ fn parse_xover_data(data: &[u8]) -> Vec<XoverEntry> {
 /// Each line format: `article_num value` (space or tab separated).
 /// The first token is the article number; everything after the first
 /// whitespace is the header value.
-fn parse_header_data(data: &[u8]) -> Vec<HeaderEntry> {
+/// Parse the multi-line data returned by an XHDR or XPAT command.
+pub fn parse_header_data(data: &[u8]) -> Vec<HeaderEntry> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
 
@@ -1891,7 +2058,8 @@ fn parse_header_data(data: &[u8]) -> Vec<HeaderEntry> {
 ///
 /// Each line format: `groupname last first posting_flag`
 /// Fields are whitespace-separated.
-fn parse_list_active_data(data: &[u8]) -> Vec<ListActiveEntry> {
+/// Parse the multi-line data returned by LIST ACTIVE.
+pub fn parse_list_active_data(data: &[u8]) -> Vec<ListActiveEntry> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
 
@@ -2132,6 +2300,7 @@ mod tests {
     use super::*;
     use crate::testutil::{MockConfig, MockNntpServer, test_config, test_config_with_auth};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // Pure helper function tests (existing)
@@ -2336,6 +2505,35 @@ mod tests {
         conn.connect(&config).await.unwrap();
         assert_eq!(conn.state, ConnectionState::Ready);
         assert!(conn.is_connected());
+    }
+
+    #[tokio::test]
+    async fn zero_ramp_up_allows_configured_connections_to_start_together() {
+        let server = MockNntpServer::start(MockConfig {
+            response_delay: Some(Duration::from_millis(10)),
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let started = Instant::now();
+        let mut connections = tokio::task::JoinSet::new();
+
+        for id in 0..8 {
+            let config = config.clone();
+            connections.spawn(async move {
+                let mut conn = NntpConnection::new(format!("parallel-{id}"));
+                conn.connect(&config).await
+            });
+        }
+
+        while let Some(result) = connections.join_next().await {
+            result.expect("connection task panicked").unwrap();
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "zero configured ramp-up must not be overridden by a global connection gate"
+        );
     }
 
     #[tokio::test]
@@ -2570,6 +2768,106 @@ mod tests {
         assert_eq!(conn.state, ConnectionState::Ready);
     }
 
+    #[test]
+    fn body_pool_reuses_checked_out_buffer() {
+        let mut conn = NntpConnection::new("test".into());
+
+        let mut buf = conn.checkout_body_buffer();
+        buf.extend_from_slice(b"first article body");
+        let capacity_after_fill = buf.capacity();
+        conn.release_body_buffer(buf);
+
+        let reused = conn.checkout_body_buffer();
+        // The pool must hand back the same (or larger) allocation rather
+        // than a fresh zero-capacity Vec — this is what actually avoids the
+        // per-article page-fault cost. If this regresses to a fresh Vec,
+        // pooling is silently not happening.
+        assert!(
+            reused.capacity() >= capacity_after_fill,
+            "expected pooled buffer capacity to be retained, got {} (was {})",
+            reused.capacity(),
+            capacity_after_fill
+        );
+    }
+
+    #[test]
+    fn body_pool_clears_stale_data_on_checkout() {
+        // Fault-path: a released buffer must come back empty, not still
+        // holding the previous article's bytes. If `release_body_buffer`
+        // or the fill path ever forgot to clear, a reused buffer would leak
+        // the prior article's data into the next one's decode input.
+        let mut conn = NntpConnection::new("test".into());
+
+        let mut buf = conn.checkout_body_buffer();
+        buf.extend_from_slice(b"leftover data from a previous article");
+        conn.release_body_buffer(buf);
+
+        let reused = conn.checkout_body_buffer();
+        assert!(
+            reused.is_empty(),
+            "checked-out buffer must be empty, found {} stale bytes",
+            reused.len()
+        );
+    }
+
+    #[test]
+    fn body_pool_is_bounded() {
+        // Fault-path: releasing far more buffers than any realistic
+        // pipeline depth must not let the free list grow without bound.
+        let mut conn = NntpConnection::new("test".into());
+        for _ in 0..(BODY_POOL_MAX_IDLE * 4) {
+            let buf = conn.checkout_body_buffer();
+            conn.release_body_buffer(buf);
+        }
+        assert!(conn.body_pool.len() <= BODY_POOL_MAX_IDLE);
+    }
+
+    #[test]
+    fn body_pool_drops_oversized_buffers() {
+        let mut conn = NntpConnection::new("test".into());
+        let mut buf = Vec::with_capacity(BODY_BUFFER_MAX_RETAINED_CAPACITY + 1);
+        buf.extend_from_slice(b"oversized article");
+        conn.release_body_buffer(buf);
+        assert!(conn.body_pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_article_body_pool_round_trip_is_correct() {
+        // Two distinct articles fetched with the pool cycled between them,
+        // proving reuse doesn't corrupt or truncate the second article's
+        // data (the correctness property that matters more than the
+        // allocation-avoidance itself).
+        let mut articles = HashMap::new();
+        articles.insert("art1@test".into(), b"first article payload".to_vec());
+        articles.insert(
+            "art2@test".into(),
+            b"second, differently sized article payload with more bytes".to_vec(),
+        );
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let first = conn.fetch_article("art1@test").await.unwrap();
+        let first_data = first.data.unwrap();
+        assert!(String::from_utf8_lossy(&first_data).contains("first article payload"));
+        conn.release_body_buffer(first_data);
+
+        let second = conn.fetch_article("art2@test").await.unwrap();
+        let second_data = second.data.unwrap();
+        let second_body = String::from_utf8_lossy(&second_data);
+        assert!(second_body.contains("second, differently sized article payload with more bytes"));
+        assert!(
+            !second_body.contains("first article payload"),
+            "second fetch must not contain leftover bytes from the first"
+        );
+    }
+
     #[tokio::test]
     async fn test_fetch_body_success() {
         let mut articles = HashMap::new();
@@ -2677,6 +2975,65 @@ mod tests {
             Err(crate::error::NntpError::ArticleNotFound(_))
         ));
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_post_article_bytes_success_preserves_binary_and_dot_lines() {
+        let posted_articles = Arc::new(parking_lot::Mutex::new(Vec::<Vec<u8>>::new()));
+        let server = MockNntpServer::start(MockConfig {
+            posted_articles: Some(posted_articles.clone()),
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let article = [
+            b"From: test@example.com\r\n".as_slice(),
+            b"Newsgroups: alt.binaries.test\r\n",
+            b"Subject: binary-post\r\n",
+            b"\r\n",
+            b"plain-line\r\n",
+            b".leading-dot\r\n",
+            b"..double-dot\r\n",
+            &[0xff, 0x00, 0x80, b'\r', b'\n'],
+        ]
+        .concat();
+
+        let response = conn.post_article_bytes(&article).await.unwrap();
+        assert_eq!(response.code, 240);
+        assert_eq!(conn.state, ConnectionState::Ready);
+
+        let captured = posted_articles.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], article);
+    }
+
+    #[tokio::test]
+    async fn test_post_article_bytes_not_permitted() {
+        let server = MockNntpServer::start(MockConfig {
+            post_not_permitted: true,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let response = conn
+            .post_article_bytes(b"From: a\r\n\r\nbody\r\n")
+            .await
+            .unwrap();
+        assert_eq!(response.code, 440);
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_post_article_bytes_wrong_state() {
+        let mut conn = NntpConnection::new("test".into());
+        let result = conn.post_article_bytes(b"From: a\r\n\r\nbody\r\n").await;
+        assert!(matches!(result, Err(crate::error::NntpError::Protocol(_))));
     }
 
     #[tokio::test]
