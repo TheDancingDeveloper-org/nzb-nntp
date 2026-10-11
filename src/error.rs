@@ -39,13 +39,22 @@ pub enum NntpError {
     #[error("No such group: {0}")]
     NoSuchGroup(String),
 
-    /// No article selected / no article in group (412, 420).
+    /// No article selected / no article in group / no article with that
+    /// number (412, 420, 423).
     #[error("No article selected: {0}")]
     NoArticleSelected(String),
 
     /// NNTP protocol violation or unexpected response.
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    /// The server explicitly rejected a command as unsupported.
+    #[error("Unsupported command: {0}")]
+    UnsupportedCommand(String),
+
+    /// A bounded NNTP response exceeded its admitted byte limit.
+    #[error("Response too large: {0}")]
+    ResponseTooLarge(String),
 
     /// Underlying I/O error.
     #[error("I/O error: {0}")]

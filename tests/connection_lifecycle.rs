@@ -145,6 +145,41 @@ async fn test_stat_article_exists() {
 }
 
 #[tokio::test]
+async fn test_stat_article_fatal_codes_mark_connection_error() {
+    use nzb_nntp::connection::ConnectionState;
+
+    for (code, check) in [
+        (
+            502u16,
+            (|e: &NntpError| matches!(e, NntpError::ServiceUnavailable(_)))
+                as fn(&NntpError) -> bool,
+        ),
+        (403, |e| matches!(e, NntpError::PermissionDenied(_))),
+        (400, |e| {
+            matches!(e, NntpError::Protocol(_) | NntpError::Connection(_))
+        }),
+    ] {
+        let mut overrides = HashMap::new();
+        overrides.insert("doomed".to_string(), code);
+        let server = MockNntpServer::start(MockConfig {
+            article_response_overrides: overrides,
+            ..Default::default()
+        })
+        .await;
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&test_config(server.port())).await.unwrap();
+
+        let err = conn.stat_article("doomed").await.unwrap_err();
+        assert!(check(&err), "{code}: unexpected error {err:?}");
+        assert_eq!(
+            conn.state,
+            ConnectionState::Error,
+            "{code} must not leave the connection reusable"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_stat_article_missing() {
     let server = MockNntpServer::start(MockConfig::default()).await;
 
@@ -233,6 +268,41 @@ async fn test_xover_range() {
     let entries = conn.xover(1, 3).await.unwrap();
     assert_eq!(entries.len(), 3, "should return 3 XOVER entries");
 
+    conn.quit().await.unwrap();
+}
+
+/// BUG-106: RFC 3977 answers XOVER of an expired range with `423 No articles
+/// in that range`. That is an empty result, not a protocol error, and the
+/// connection stays usable.
+#[tokio::test]
+async fn test_xover_expired_range_423_is_empty() {
+    let mut groups = HashMap::new();
+    groups.insert("alt.test".to_string(), (3, 500, 502));
+
+    let server = MockNntpServer::start(MockConfig {
+        groups,
+        xover_entries: vec!["500\tSubject\tuser@test\t01 Jan 2024\t<mid500>\t\t100\t5".to_string()],
+        xover_423_outside_group: true,
+        ..Default::default()
+    })
+    .await;
+
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+    conn.group("alt.test").await.unwrap();
+
+    let entries = conn.xover(1, 100).await.expect("423 is an empty range");
+    assert!(entries.is_empty());
+    let format = conn.overview_format().await.unwrap();
+    let rows = conn
+        .xover_lossless(1, 100, &format)
+        .await
+        .expect("423 is an empty range for the lossless variant too");
+    assert!(rows.rows.is_empty());
+
+    // Still usable afterwards.
+    assert_eq!(conn.xover(500, 502).await.unwrap().len(), 1);
     conn.quit().await.unwrap();
 }
 

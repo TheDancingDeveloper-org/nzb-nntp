@@ -35,10 +35,34 @@ const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 /// each individual line read must complete within this window.
 const READ_BODY_LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Timeout for a single write (and its flush) to the server. A peer that
+/// stops reading fills the socket buffers and would otherwise block the
+/// writer forever; matching the read-side budget turns that into an I/O
+/// error so workers can reconnect, exactly as a read timeout does.
+const WRITE_TIMEOUT: Duration = READ_LINE_TIMEOUT;
+
+/// Bound an outgoing write by `limit`, mapping expiry to
+/// `io::ErrorKind::TimedOut` (the same shape as read timeouts).
+async fn with_write_timeout<F>(limit: Duration, fut: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("write timed out after {}s", limit.as_secs()),
+        )),
+    }
+}
+
 use crate::capabilities::NntpCapabilities;
 use crate::config::{ListActiveEntry, ServerConfig};
 
 use crate::error::{NntpError, NntpResult};
+use crate::overview::{
+    LosslessOverviewRows, OverviewFormat, parse_lossless_overview_rows, parse_overview_format,
+};
 
 // ---------------------------------------------------------------------------
 // Response
@@ -53,6 +77,12 @@ pub struct NntpResponse {
     pub message: String,
     /// Multi-line body data, if any. Dot-stuffing has been undone.
     pub data: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BodyPrefixResponse {
+    pub data: Vec<u8>,
+    pub complete: bool,
 }
 
 impl NntpResponse {
@@ -116,6 +146,12 @@ pub struct HeaderEntry {
     pub article_num: u64,
     /// The header field value for this article.
     pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundedResponse<T> {
+    pub value: T,
+    pub response_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,18 +227,21 @@ impl Transport {
         }
     }
 
-    /// Write all bytes and flush.
-    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        match self {
-            Transport::Plain(r) => {
-                r.get_mut().write_all(data).await?;
-                r.get_mut().flush().await
+    /// Write all bytes and flush, bounded by `limit`.
+    async fn write_all(&mut self, data: &[u8], limit: Duration) -> std::io::Result<()> {
+        with_write_timeout(limit, async {
+            match self {
+                Transport::Plain(r) => {
+                    r.get_mut().write_all(data).await?;
+                    r.get_mut().flush().await
+                }
+                Transport::Tls(r) => {
+                    r.get_mut().write_all(data).await?;
+                    r.get_mut().flush().await
+                }
             }
-            Transport::Tls(r) => {
-                r.get_mut().write_all(data).await?;
-                r.get_mut().flush().await
-            }
-        }
+        })
+        .await
     }
 
     /// Shut down the write half.
@@ -272,6 +311,9 @@ pub struct NntpConnection {
     /// the per-article page-fault/allocation cost identified by profiling —
     /// see `docs/PERFORMANCE_STATUS.md`.
     body_pool: Vec<Vec<u8>>,
+    /// Upper bound on each socket write/flush. Always [`WRITE_TIMEOUT`]
+    /// outside of tests.
+    write_timeout: Duration,
 }
 
 /// Article bodies are typically well under 1 MiB (yEnc articles are usually
@@ -296,7 +338,15 @@ impl NntpConnection {
             capabilities: NntpCapabilities::default_assumed(),
             line_scratch: Vec::with_capacity(16 * 1024),
             body_pool: Vec::new(),
+            write_timeout: WRITE_TIMEOUT,
         }
+    }
+
+    /// Test-only: shorten the write timeout so a stalled peer can be
+    /// exercised without waiting the full production budget.
+    #[cfg(test)]
+    pub(crate) fn set_write_timeout_for_test(&mut self, limit: Duration) {
+        self.write_timeout = limit;
     }
 
     /// Check out a reusable article-body buffer, or allocate a fresh one if
@@ -928,6 +978,34 @@ impl NntpConnection {
         }
     }
 
+    async fn read_multiline_body_maybe_decompress_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> NntpResult<Vec<u8>> {
+        let raw = self.read_multiline_body_bounded(max_bytes).await?;
+        if self.compress_enabled && raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+            use flate2::read::GzDecoder;
+            use std::io::Read;
+
+            let decoder = GzDecoder::new(&raw[..]);
+            let mut decompressed = Vec::with_capacity(max_bytes.min(raw.len() * 4));
+            decoder
+                .take(max_bytes as u64 + 1)
+                .read_to_end(&mut decompressed)
+                .map_err(|error| {
+                    NntpError::Protocol(format!("gzip HEAD decode failed: {error}"))
+                })?;
+            if decompressed.len() > max_bytes {
+                return Err(NntpError::ResponseTooLarge(
+                    "decompressed multi-line response exceeds its byte bound".into(),
+                ));
+            }
+            Ok(decompressed)
+        } else {
+            Ok(raw)
+        }
+    }
+
     // ------------------------------------------------------------------
     // ARTICLE command
     // ------------------------------------------------------------------
@@ -977,7 +1055,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoSuchGroup(status.message))
             }
-            412 | 420 => {
+            412 | 420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }
@@ -1038,6 +1116,86 @@ impl NntpConnection {
         }
     }
 
+    /// Fetch exact headers for one article number in the selected group.
+    pub async fn fetch_head_number(
+        &mut self,
+        article_number: u64,
+        max_header_bytes: usize,
+    ) -> NntpResult<NntpResponse> {
+        if !self.capabilities.have_head {
+            return Err(NntpError::Protocol("Server does not support HEAD".into()));
+        }
+        if article_number == 0 || max_header_bytes == 0 || max_header_bytes > 64 * 1024 {
+            return Err(NntpError::Protocol("HEAD request bound is invalid".into()));
+        }
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot HEAD in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        self.send_command(&format!("HEAD {article_number}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            221 => {
+                let data = self
+                    .read_multiline_body_maybe_decompress_bounded(max_header_bytes)
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                Ok(NntpResponse {
+                    code: status.code,
+                    message: status.message,
+                    data: Some(data),
+                })
+            }
+            423 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::ArticleNotFound(article_number.to_string()))
+            }
+            411 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoSuchGroup(status.message))
+            }
+            412 | 420 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoArticleSelected(status.message))
+            }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
+            480 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::AuthRequired(status.message))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "HEAD rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected HEAD response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // STAT command (pre-check)
     // ------------------------------------------------------------------
@@ -1072,11 +1230,27 @@ impl NntpConnection {
             .read_response_line()
             .await
             .inspect_err(|_| self.state = ConnectionState::Error)?;
-        self.state = ConnectionState::Ready;
 
+        // Only 223/430 leave the session healthy; every other code means the
+        // provider refused or is going away, so the connection must not be
+        // returned to the pool as Ready.
         match resp.code {
-            223 => Ok(resp),
-            430 => Err(NntpError::ArticleNotFound(mid)),
+            223 => {
+                self.state = ConnectionState::Ready;
+                Ok(resp)
+            }
+            430 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::ArticleNotFound(mid))
+            }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(resp.message))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(resp.message))
+            }
             480 => {
                 self.state = ConnectionState::Error;
                 Err(NntpError::AuthRequired(resp.message))
@@ -1088,10 +1262,54 @@ impl NntpConnection {
                     resp.code, resp.message
                 )))
             }
-            _ => Err(NntpError::Protocol(format!(
-                "Unexpected STAT response {}: {}",
-                resp.code, resp.message
-            ))),
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected STAT response {}: {}",
+                    resp.code, resp.message
+                )))
+            }
+        }
+    }
+
+    /// Cheap liveness probe for the pool's idle health check.
+    ///
+    /// Sends `DATE` (RFC 3977 §7.1) and reads a single status line, so it
+    /// always does real I/O no matter which capabilities the server
+    /// advertised (unlike `stat_article`, which short-circuits without
+    /// touching the socket when STAT is not available). Any single-line
+    /// reply — even `500` from a server without DATE — proves the socket is
+    /// alive and in sync; session-ending codes and I/O errors mark the
+    /// connection as `Error`.
+    pub(crate) async fn ping(&mut self) -> NntpResult<()> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot ping in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+
+        self.send_command("DATE")
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let resp = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+
+        match resp.code {
+            400 | 403 | 480 | 481 | 482 | 502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Connection(format!(
+                    "Health check rejected ({}): {}",
+                    resp.code, resp.message
+                )))
+            }
+            _ => {
+                self.state = ConnectionState::Ready;
+                Ok(())
+            }
         }
     }
 
@@ -1172,6 +1390,156 @@ impl NntpConnection {
     // XOVER command (RFC 2980 Section 2.8)
     // ------------------------------------------------------------------
 
+    pub async fn overview_format(&mut self) -> NntpResult<OverviewFormat> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot LIST OVERVIEW.FMT in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        self.send_command("LIST OVERVIEW.FMT")
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            215 => {
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                parse_overview_format(&data)
+            }
+            480 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::AuthRequired(status.message))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "LIST OVERVIEW.FMT rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected LIST OVERVIEW.FMT response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
+    pub async fn xover_lossless(
+        &mut self,
+        start: u64,
+        end: u64,
+        format: &OverviewFormat,
+    ) -> NntpResult<LosslessOverviewRows> {
+        self.xover_lossless_with_limit(start, end, format, None)
+            .await
+            .map(|response| response.value)
+    }
+
+    pub async fn xover_lossless_bounded(
+        &mut self,
+        start: u64,
+        end: u64,
+        format: &OverviewFormat,
+        max_response_bytes: usize,
+    ) -> NntpResult<BoundedResponse<LosslessOverviewRows>> {
+        if max_response_bytes == 0 || max_response_bytes > 8 * 1024 * 1024 {
+            return Err(NntpError::Protocol(
+                "XOVER response bound is invalid".into(),
+            ));
+        }
+        self.xover_lossless_with_limit(start, end, format, Some(max_response_bytes))
+            .await
+    }
+
+    async fn xover_lossless_with_limit(
+        &mut self,
+        start: u64,
+        end: u64,
+        format: &OverviewFormat,
+        max_response_bytes: Option<usize>,
+    ) -> NntpResult<BoundedResponse<LosslessOverviewRows>> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot XOVER in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        self.send_command(&format!("XOVER {start}-{end}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            224 => {
+                let data = match max_response_bytes {
+                    Some(maximum) => {
+                        self.read_multiline_body_maybe_decompress_bounded(maximum)
+                            .await
+                    }
+                    None => self.read_multiline_body_maybe_decompress().await,
+                }
+                .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                Ok(BoundedResponse {
+                    response_bytes: data.len(),
+                    value: parse_lossless_overview_rows(&data, format, start, end),
+                })
+            }
+            420 | 423 => {
+                self.state = ConnectionState::Ready;
+                Ok(BoundedResponse {
+                    value: LosslessOverviewRows {
+                        rows: Vec::new(),
+                        defective_rows: Vec::new(),
+                    },
+                    response_bytes: 0,
+                })
+            }
+            412 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoSuchGroup(
+                    "No newsgroup selected (send GROUP first)".into(),
+                ))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "XOVER rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected XOVER response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
     /// Fetch overview data for a range of article numbers.
     ///
     /// Sends `XOVER start-end` and parses the tab-delimited multi-line response.
@@ -1214,7 +1582,7 @@ impl NntpConnection {
                 );
                 Ok(entries)
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(Vec::new()) // No articles in range
             }
@@ -1284,7 +1652,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Ok(parse_header_data(&data))
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(Vec::new()) // No articles in range
             }
@@ -1333,6 +1701,32 @@ impl NntpConnection {
         range: ArticleRange,
         patterns: &[&str],
     ) -> NntpResult<Vec<HeaderEntry>> {
+        self.xpat_with_limit(header, range, patterns, None)
+            .await
+            .map(|response| response.value)
+    }
+
+    pub async fn xpat_bounded(
+        &mut self,
+        header: &str,
+        range: ArticleRange,
+        patterns: &[&str],
+        max_response_bytes: usize,
+    ) -> NntpResult<BoundedResponse<Vec<HeaderEntry>>> {
+        if max_response_bytes == 0 || max_response_bytes > 8 * 1024 * 1024 {
+            return Err(NntpError::Protocol("XPAT response bound is invalid".into()));
+        }
+        self.xpat_with_limit(header, range, patterns, Some(max_response_bytes))
+            .await
+    }
+
+    async fn xpat_with_limit(
+        &mut self,
+        header: &str,
+        range: ArticleRange,
+        patterns: &[&str],
+        max_response_bytes: Option<usize>,
+    ) -> NntpResult<BoundedResponse<Vec<HeaderEntry>>> {
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
                 "Cannot XPAT in state {:?}",
@@ -1358,16 +1752,26 @@ impl NntpConnection {
 
         match status.code {
             221 => {
-                let data = self
-                    .read_multiline_body_maybe_decompress()
-                    .await
-                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                let data = match max_response_bytes {
+                    Some(maximum) => {
+                        self.read_multiline_body_maybe_decompress_bounded(maximum)
+                            .await
+                    }
+                    None => self.read_multiline_body_maybe_decompress().await,
+                }
+                .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
-                Ok(parse_header_data(&data))
+                Ok(BoundedResponse {
+                    response_bytes: data.len(),
+                    value: parse_header_data(&data),
+                })
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
-                Ok(Vec::new()) // No articles matched
+                Ok(BoundedResponse {
+                    value: Vec::new(),
+                    response_bytes: 0,
+                })
             }
             412 => {
                 self.state = ConnectionState::Ready;
@@ -1389,6 +1793,13 @@ impl NntpConnection {
             502 => {
                 self.state = ConnectionState::Error;
                 Err(NntpError::ServiceUnavailable(status.message))
+            }
+            500 | 501 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::UnsupportedCommand(format!(
+                    "XPAT unsupported ({}): {}",
+                    status.code, status.message
+                )))
             }
             _ => {
                 self.state = ConnectionState::Error;
@@ -1462,7 +1873,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::ArticleNotFound(mid))
             }
-            412 | 420 => {
+            412 | 420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }
@@ -1485,6 +1896,97 @@ impl NntpConnection {
                 self.state = ConnectionState::Error;
                 Err(NntpError::Protocol(format!(
                     "Unexpected BODY response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
+    pub async fn fetch_body_prefix(
+        &mut self,
+        message_id: &str,
+        max_bytes: usize,
+    ) -> NntpResult<BodyPrefixResponse> {
+        if max_bytes == 0 || max_bytes > 256 * 1024 {
+            return Err(NntpError::Protocol(
+                "BODY prefix request bound is invalid".into(),
+            ));
+        }
+        if self.compress_enabled {
+            return Err(NntpError::UnsupportedCommand(
+                "BODY prefix requires an uncompressed observation connection".into(),
+            ));
+        }
+        if !self.capabilities.have_body {
+            return Err(NntpError::UnsupportedCommand(
+                "Server does not support BODY prefix observation".into(),
+            ));
+        }
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot BODY prefix in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        let mid = normalize_message_id(message_id);
+        self.send_command(&format!("BODY {mid}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            222 => {
+                let prefix = self
+                    .read_multiline_body_prefix(max_bytes)
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                if prefix.complete {
+                    self.state = ConnectionState::Ready;
+                } else {
+                    self.transport.take();
+                    self.compress_enabled = false;
+                    self.state = ConnectionState::Disconnected;
+                }
+                Ok(prefix)
+            }
+            430 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::ArticleNotFound(mid))
+            }
+            412 | 420 | 423 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoArticleSelected(status.message))
+            }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
+            480 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::AuthRequired(status.message))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "BODY prefix rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            500 | 501 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::UnsupportedCommand(status.message))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected BODY prefix response {}: {}",
                     status.code, status.message
                 )))
             }
@@ -1589,6 +2091,7 @@ impl NntpConnection {
             340 => {
                 // Server says "send article"
                 // Send each line, dot-stuffing lines that start with '.'
+                let write_timeout = self.write_timeout;
                 let transport = self
                     .transport
                     .as_mut()
@@ -1597,7 +2100,7 @@ impl NntpConnection {
                 for line in article.lines() {
                     if line.starts_with('.') {
                         transport
-                            .write_all(format!(".{line}\r\n").as_bytes())
+                            .write_all(format!(".{line}\r\n").as_bytes(), write_timeout)
                             .await
                             .map_err(|e| {
                                 self.state = ConnectionState::Error;
@@ -1605,7 +2108,7 @@ impl NntpConnection {
                             })?;
                     } else {
                         transport
-                            .write_all(format!("{line}\r\n").as_bytes())
+                            .write_all(format!("{line}\r\n").as_bytes(), write_timeout)
                             .await
                             .map_err(|e| {
                                 self.state = ConnectionState::Error;
@@ -1615,10 +2118,13 @@ impl NntpConnection {
                 }
 
                 // Send termination line
-                transport.write_all(b".\r\n").await.map_err(|e| {
-                    self.state = ConnectionState::Error;
-                    NntpError::Io(e)
-                })?;
+                transport
+                    .write_all(b".\r\n", write_timeout)
+                    .await
+                    .map_err(|e| {
+                        self.state = ConnectionState::Error;
+                        NntpError::Io(e)
+                    })?;
 
                 // Read final response
                 let result = self
@@ -1669,6 +2175,7 @@ impl NntpConnection {
 
         match status.code {
             340 => {
+                let write_timeout = self.write_timeout;
                 let transport = self
                     .transport
                     .as_mut()
@@ -1686,19 +2193,28 @@ impl NntpConnection {
                         .unwrap_or(&article[start..line_end]);
 
                     if line.starts_with(b".") {
-                        transport.write_all(b".").await.map_err(|e| {
+                        transport
+                            .write_all(b".", write_timeout)
+                            .await
+                            .map_err(|e| {
+                                self.state = ConnectionState::Error;
+                                NntpError::Io(e)
+                            })?;
+                    }
+                    transport
+                        .write_all(line, write_timeout)
+                        .await
+                        .map_err(|e| {
                             self.state = ConnectionState::Error;
                             NntpError::Io(e)
                         })?;
-                    }
-                    transport.write_all(line).await.map_err(|e| {
-                        self.state = ConnectionState::Error;
-                        NntpError::Io(e)
-                    })?;
-                    transport.write_all(b"\r\n").await.map_err(|e| {
-                        self.state = ConnectionState::Error;
-                        NntpError::Io(e)
-                    })?;
+                    transport
+                        .write_all(b"\r\n", write_timeout)
+                        .await
+                        .map_err(|e| {
+                            self.state = ConnectionState::Error;
+                            NntpError::Io(e)
+                        })?;
 
                     start = match nl_pos {
                         Some(p) => p + 1,
@@ -1706,10 +2222,13 @@ impl NntpConnection {
                     };
                 }
 
-                transport.write_all(b".\r\n").await.map_err(|e| {
-                    self.state = ConnectionState::Error;
-                    NntpError::Io(e)
-                })?;
+                transport
+                    .write_all(b".\r\n", write_timeout)
+                    .await
+                    .map_err(|e| {
+                        self.state = ConnectionState::Error;
+                        NntpError::Io(e)
+                    })?;
 
                 let result = self
                     .read_response_line()
@@ -1756,8 +2275,9 @@ impl NntpConnection {
             }
 
             // Shut down the socket
+            let write_timeout = self.write_timeout;
             if let Some(ref mut transport) = self.transport {
-                let _ = transport.shutdown().await;
+                let _ = with_write_timeout(write_timeout, transport.shutdown()).await;
             }
         }
 
@@ -1788,10 +2308,13 @@ impl NntpConnection {
 
         let mut line = cmd.to_string();
         line.push_str("\r\n");
-        match transport {
-            Transport::Plain(r) => r.get_mut().write_all(line.as_bytes()).await,
-            Transport::Tls(r) => r.get_mut().write_all(line.as_bytes()).await,
-        }
+        with_write_timeout(self.write_timeout, async {
+            match transport {
+                Transport::Plain(r) => r.get_mut().write_all(line.as_bytes()).await,
+                Transport::Tls(r) => r.get_mut().write_all(line.as_bytes()).await,
+            }
+        })
+        .await
         .map_err(NntpError::Io)?;
         Ok(())
     }
@@ -1802,10 +2325,13 @@ impl NntpConnection {
             .transport
             .as_mut()
             .ok_or(NntpError::Connection("Not connected".into()))?;
-        match transport {
-            Transport::Plain(r) => r.get_mut().flush().await,
-            Transport::Tls(r) => r.get_mut().flush().await,
-        }
+        with_write_timeout(self.write_timeout, async {
+            match transport {
+                Transport::Plain(r) => r.get_mut().flush().await,
+                Transport::Tls(r) => r.get_mut().flush().await,
+            }
+        })
+        .await
         .map_err(NntpError::Io)?;
         Ok(())
     }
@@ -1852,8 +2378,65 @@ impl NntpConnection {
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
         let mut body = self.checkout_body_buffer();
-        self.read_multiline_body_into(&mut body).await?;
+        self.read_multiline_body_into_bounded(&mut body, None)
+            .await?;
         Ok(body)
+    }
+
+    async fn read_multiline_body_bounded(&mut self, max_bytes: usize) -> NntpResult<Vec<u8>> {
+        let mut body = Vec::with_capacity(max_bytes.min(16 * 1024));
+        self.read_multiline_body_into_bounded(&mut body, Some(max_bytes))
+            .await?;
+        Ok(body)
+    }
+
+    async fn read_multiline_body_prefix(
+        &mut self,
+        max_bytes: usize,
+    ) -> NntpResult<BodyPrefixResponse> {
+        let mut data = Vec::with_capacity(max_bytes.min(16 * 1024));
+        let heartbeat = self.io_heartbeat.clone();
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(NntpError::Connection("Not connected".into()))?;
+        let complete = loop {
+            self.line_scratch.clear();
+            let count = tokio::time::timeout(
+                READ_BODY_LINE_TIMEOUT,
+                transport.read_line_bytes(&mut self.line_scratch),
+            )
+            .await
+            .map_err(|_| NntpError::Timeout("BODY prefix line timed out".into()))?
+            .map_err(NntpError::Io)?;
+            if count == 0 {
+                return Err(NntpError::Connection(
+                    "Server closed connection during BODY prefix".into(),
+                ));
+            }
+            if let Some(heartbeat) = &heartbeat {
+                heartbeat.tick();
+            }
+            if self.line_scratch == b".\r\n" || self.line_scratch == b".\n" {
+                break true;
+            }
+            if self.line_scratch.len() > 16 * 1024 {
+                return Err(NntpError::ResponseTooLarge(
+                    "BODY prefix line exceeds its byte bound".into(),
+                ));
+            }
+            let line = if self.line_scratch.starts_with(b"..") {
+                &self.line_scratch[1..]
+            } else {
+                &self.line_scratch
+            };
+            let remaining = max_bytes.saturating_sub(data.len());
+            data.extend_from_slice(&line[..line.len().min(remaining)]);
+            if line.len() > remaining || data.len() == max_bytes {
+                break false;
+            }
+        };
+        Ok(BodyPrefixResponse { data, complete })
     }
 
     /// Same as [`Self::read_multiline_body`], but fills a caller-owned
@@ -1863,7 +2446,11 @@ impl NntpConnection {
     /// checkout is what actually avoids the page-fault/allocation cost per
     /// article; passing an arbitrary fresh `Vec::new()` here still works
     /// correctly, it just forgoes the reuse benefit.
-    async fn read_multiline_body_into(&mut self, out: &mut Vec<u8>) -> NntpResult<()> {
+    async fn read_multiline_body_into_bounded(
+        &mut self,
+        out: &mut Vec<u8>,
+        max_bytes: Option<usize>,
+    ) -> NntpResult<()> {
         out.clear();
         // Clone the heartbeat ref before we take the mutable borrow on
         // `transport`, so we can tick it inside the loop body. Cheap: just
@@ -1918,11 +2505,21 @@ impl NntpConnection {
             }
 
             // Dot-unstuffing: if a line starts with "..", remove the first dot
-            if self.line_scratch.starts_with(b"..") {
-                out.extend_from_slice(&self.line_scratch[1..]);
+            let line = if self.line_scratch.starts_with(b"..") {
+                &self.line_scratch[1..]
             } else {
-                out.extend_from_slice(&self.line_scratch);
+                &self.line_scratch
+            };
+            if max_bytes.is_some_and(|maximum| {
+                out.len()
+                    .checked_add(line.len())
+                    .is_none_or(|length| length > maximum)
+            }) {
+                return Err(NntpError::ResponseTooLarge(
+                    "multi-line response exceeds its byte bound".into(),
+                ));
             }
+            out.extend_from_slice(line);
         }
 
         Ok(())
@@ -1948,15 +2545,24 @@ pub fn parse_response_line(line: &str) -> NntpResult<NntpResponse> {
         )));
     }
 
-    let code: u16 = trimmed[..3]
-        .parse()
-        .map_err(|_| NntpError::Protocol(format!("Invalid response code in: {trimmed:?}")))?;
+    // Validate the status code on raw bytes: slicing the `&str` at fixed
+    // byte offsets panics when a (valid UTF-8) multibyte char straddles
+    // them, and `u16::from_str` would also accept a leading '+'.
+    let bytes = trimmed.as_bytes();
+    if !bytes[..3].iter().all(u8::is_ascii_digit) {
+        return Err(NntpError::Protocol(format!(
+            "Invalid response code in: {trimmed:?}"
+        )));
+    }
+    let code = bytes[..3]
+        .iter()
+        .fold(0u16, |acc, b| acc * 10 + u16::from(b - b'0'));
 
-    let message = if trimmed.len() > 4 {
-        trimmed[4..].to_string()
-    } else {
-        String::new()
-    };
+    // The first three bytes are ASCII, so byte 3 is a char boundary. Skip
+    // the single separator char (normally a space) that follows the code.
+    let mut rest = trimmed[3..].chars();
+    rest.next();
+    let message = rest.as_str().to_string();
 
     Ok(NntpResponse {
         code,
@@ -2303,6 +2909,84 @@ mod tests {
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------
+    // Write timeouts against a peer that stops reading
+    // -----------------------------------------------------------------------
+
+    /// Start a peer that greets, answers every command with 500 until it sees
+    /// `STALL` or `POST` (answered with 340), and then stops reading while
+    /// keeping the socket open — so the client's send buffer fills up.
+    async fn start_stalling_peer() -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = tokio::io::BufReader::new(sock);
+            sock.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if sock.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if line.starts_with("STALL") {
+                    break;
+                }
+                if line.starts_with("POST") {
+                    sock.get_mut().write_all(b"340 send\r\n").await.unwrap();
+                    break;
+                }
+                sock.get_mut().write_all(b"500 what\r\n").await.unwrap();
+            }
+            // Hold the socket open without ever reading again.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+        port
+    }
+
+    /// Larger than any loopback send + receive buffer, so the write blocks.
+    const STALL_PAYLOAD: usize = 64 * 1024 * 1024;
+
+    fn assert_write_timed_out(err: NntpError) {
+        match err {
+            NntpError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected Io(TimedOut), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_command_times_out_when_peer_stops_reading() {
+        let port = start_stalling_peer().await;
+        let mut conn = NntpConnection::new("stall".into());
+        conn.connect(&test_config(port)).await.unwrap();
+        conn.set_write_timeout_for_test(Duration::from_millis(300));
+        conn.send_command("STALL").await.unwrap();
+
+        let huge = "X".repeat(STALL_PAYLOAD);
+        let res = tokio::time::timeout(Duration::from_secs(30), conn.send_command(&huge))
+            .await
+            .expect("send_command hung instead of timing out");
+        assert_write_timed_out(res.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_post_body_write_times_out_when_peer_stops_reading() {
+        let port = start_stalling_peer().await;
+        let mut conn = NntpConnection::new("stall".into());
+        conn.connect(&test_config(port)).await.unwrap();
+        conn.set_write_timeout_for_test(Duration::from_millis(300));
+
+        let mut article = b"Subject: x\r\n\r\n".to_vec();
+        article.extend(std::iter::repeat_n(b'y', STALL_PAYLOAD));
+        let res = tokio::time::timeout(Duration::from_secs(30), conn.post_article_bytes(&article))
+            .await
+            .expect("post_article_bytes hung instead of timing out");
+        assert_write_timed_out(res.unwrap_err());
+        assert_eq!(conn.state, ConnectionState::Error);
+    }
+
+    // -----------------------------------------------------------------------
     // Pure helper function tests (existing)
     // -----------------------------------------------------------------------
 
@@ -2356,6 +3040,29 @@ mod tests {
     fn test_parse_response_line_invalid_code() {
         let err = parse_response_line("ABC some message\r\n");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_response_line_multibyte_does_not_panic() {
+        // A multibyte char straddling byte 3 (the end of the status code).
+        let err = parse_response_line("2\u{20ac}0 bogus\r\n");
+        assert!(matches!(err, Err(NntpError::Protocol(_))), "{err:?}");
+        // A greeting that starts with a multibyte char.
+        let err = parse_response_line("\u{20ac}\u{20ac} hi\r\n");
+        assert!(matches!(err, Err(NntpError::Protocol(_))), "{err:?}");
+        // A multibyte char straddling byte 4 (the separator position).
+        let resp = parse_response_line("200\u{e9}t\u{e9}\r\n").unwrap();
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.message, "t\u{e9}");
+        // Multibyte text in the message itself is preserved.
+        let resp = parse_response_line("200 Caf\u{e9} ready\r\n").unwrap();
+        assert_eq!(resp.message, "Caf\u{e9} ready");
+    }
+
+    #[test]
+    fn test_parse_response_line_rejects_signed_code() {
+        // `u16::from_str` accepts a leading '+'; NNTP status codes do not.
+        assert!(parse_response_line("+20 nope\r\n").is_err());
     }
 
     #[test]
@@ -2552,6 +3259,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_by_article_number_is_exact_and_bounded() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 42, 42));
+        let headers = b"Date: Wed, 07 May 2025 20:50:00 +0000\r\nXref: news 42\r\n".to_vec();
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            heads: HashMap::from([(42, headers.clone())]),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("head-exact".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let response = connection
+            .fetch_head_number(42, headers.len())
+            .await
+            .unwrap();
+        assert_eq!(response.code, 221);
+        assert_eq!(response.data, Some(headers));
+
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 42, 42));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            heads: HashMap::from([(42, b"Header: value that exceeds the bound\r\n".to_vec())]),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("head-bounded".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let error = connection
+            .fetch_head_number(42, 8)
+            .await
+            .expect_err("bounded HEAD");
+        assert!(matches!(error, NntpError::ResponseTooLarge(_)));
+        assert_eq!(connection.state, ConnectionState::Error);
+    }
+
+    #[tokio::test]
     async fn test_connect_with_auth() {
         let server = MockNntpServer::start(MockConfig {
             auth_required: true,
@@ -2693,6 +3446,37 @@ mod tests {
         assert_eq!(entries[0].bytes, 50000);
         assert_eq!(entries[1].article_num, 2);
         assert_eq!(entries[1].bytes, 60000);
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn lossless_overview_negotiates_format_and_retains_defects() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (2u64, 1u64, 2u64));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            xover_raw_entries: vec![
+                b"1\tEspa\xf1a\tposter@test\tDate\t<one@test>\t\t10\t1".to_vec(),
+                b"2\tSub\tject\tposter@test\tDate\t<two@test>\t\t10\t1".to_vec(),
+            ],
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+        conn.group("alt.binaries.test").await.unwrap();
+
+        let format = conn.overview_format().await.unwrap();
+        let rows = conn.xover_lossless(1, 2, &format).await.unwrap();
+
+        assert_eq!(format.fields.len(), 7);
+        assert_eq!(rows.rows[0].fields[0], b"Espa\xf1a");
+        assert_eq!(rows.defective_rows[0].article_number, Some(2));
+        assert_eq!(
+            rows.defective_rows[0].failure_code,
+            crate::overview::DefectiveOverviewRowCode::FieldCountInvalid
+        );
         assert_eq!(conn.state, ConnectionState::Ready);
     }
 
@@ -2887,6 +3671,48 @@ mod tests {
         let data = response.data.unwrap();
         let body = String::from_utf8_lossy(&data);
         assert!(body.contains("Body content here"));
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn body_prefix_retires_an_incomplete_connection_without_exceeding_the_bound() {
+        let mut articles = HashMap::new();
+        articles.insert(
+            "prefix@test".into(),
+            b"first line\r\nsecond line\r\n".to_vec(),
+        );
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let prefix = conn.fetch_body_prefix("prefix@test", 8).await.unwrap();
+        assert_eq!(prefix.data, b"first li");
+        assert!(!prefix.complete);
+        assert_eq!(conn.state, ConnectionState::Disconnected);
+        assert!(!conn.is_connected());
+    }
+
+    #[tokio::test]
+    async fn body_prefix_keeps_a_complete_bounded_connection_ready() {
+        let mut articles = HashMap::new();
+        articles.insert("small@test".into(), b"small\r\n".to_vec());
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let prefix = conn.fetch_body_prefix("small@test", 1024).await.unwrap();
+        assert_eq!(prefix.data, b"small\r\n");
+        assert!(prefix.complete);
         assert_eq!(conn.state, ConnectionState::Ready);
     }
 
@@ -3370,6 +4196,66 @@ mod tests {
             .unwrap();
         assert!(entries.is_empty());
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn unsupported_xpat_keeps_the_connection_ready_for_bounded_xover() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 1, 1));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            xpat_unsupported: true,
+            xover_entries: vec![
+                "1\tTraitors Espana S02E01\tposter\tWed, 07 May 2025 20:50:00 +0000\t<1@test>\t\t100\t1".into(),
+            ],
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("xpat-fallback".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let format = connection.overview_format().await.unwrap();
+        let error = connection
+            .xpat_bounded("Subject", ArticleRange::Range(1, 1), &["*Traitors*"], 1024)
+            .await
+            .expect_err("unsupported XPAT");
+        assert!(matches!(error, NntpError::UnsupportedCommand(_)));
+        assert_eq!(connection.state, ConnectionState::Ready);
+        let overview = connection
+            .xover_lossless_bounded(1, 1, &format, 1024)
+            .await
+            .unwrap();
+        assert_eq!(overview.value.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_lossless_xover_fails_before_retaining_an_oversized_response() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 1, 1));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            xover_entries: vec![
+                "1\tTraitors Espana S02E01\tposter\tWed, 07 May 2025 20:50:00 +0000\t<1@test>\t\t100\t1".into(),
+            ],
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("xover-bounded".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let format = connection.overview_format().await.unwrap();
+        let error = connection
+            .xover_lossless_bounded(1, 1, &format, 8)
+            .await
+            .expect_err("bounded XOVER");
+        assert!(matches!(error, NntpError::ResponseTooLarge(_)));
+        assert_eq!(connection.state, ConnectionState::Error);
     }
 
     #[tokio::test]

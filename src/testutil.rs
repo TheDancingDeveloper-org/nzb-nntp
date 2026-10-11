@@ -110,14 +110,30 @@ pub struct MockConfig {
     pub groups: HashMap<String, (u64, u64, u64)>,
     /// Articles: message-id (without angle brackets) -> body bytes.
     pub articles: HashMap<String, Vec<u8>>,
+    /// Exact HEAD response bytes keyed by article number.
+    pub heads: HashMap<u64, Vec<u8>>,
     /// XOVER entries as pre-formatted tab-delimited lines.
     pub xover_entries: Vec<String>,
+    /// XOVER entries keyed by the exact requested article range.
+    pub xover_entries_by_range: HashMap<String, Vec<String>>,
+    /// Raw XOVER entries used when exact non-UTF-8 bytes are required.
+    pub xover_raw_entries: Vec<Vec<u8>>,
+    /// If true, XOVER of a range lying entirely outside the selected
+    /// group's `first..=last` answers `423 No articles in that range`, as an
+    /// RFC 3977 server does once the requested articles have expired.
+    pub xover_423_outside_group: bool,
     /// XHDR entries as pre-formatted `artnum value` lines.
     pub xhdr_entries: Vec<String>,
     /// XPAT entries as pre-formatted `artnum value` lines.
     pub xpat_entries: Vec<String>,
+    /// XPAT entries keyed by the exact range and pattern arguments.
+    pub xpat_entries_by_request: HashMap<String, Vec<String>>,
+    /// If true, XPAT returns an unsupported-command response.
+    pub xpat_unsupported: bool,
     /// LIST ACTIVE entries as pre-formatted `groupname last first status` lines.
     pub list_active_entries: Vec<String>,
+    /// LIST OVERVIEW.FMT entries in negotiated order.
+    pub overview_format_entries: Vec<String>,
     /// If true, `POST` returns 440 instead of accepting an article body.
     pub post_not_permitted: bool,
     /// Captured raw articles received via `POST`, after un-dot-stuffing and
@@ -173,10 +189,25 @@ impl Default for MockConfig {
             service_unavailable: false,
             groups: HashMap::new(),
             articles: HashMap::new(),
+            heads: HashMap::new(),
             xover_entries: Vec::new(),
+            xover_entries_by_range: HashMap::new(),
+            xover_raw_entries: Vec::new(),
+            xover_423_outside_group: false,
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
+            xpat_entries_by_request: HashMap::new(),
+            xpat_unsupported: false,
             list_active_entries: Vec::new(),
+            overview_format_entries: vec![
+                "Subject:".into(),
+                "From:".into(),
+                "Date:".into(),
+                "Message-ID:".into(),
+                "References:".into(),
+                ":bytes".into(),
+                ":lines".into(),
+            ],
             post_not_permitted: false,
             posted_articles: None,
             silent_close_after_bytes: None,
@@ -500,19 +531,61 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             }
 
             "XOVER" => {
+                let range_entries = parts
+                    .get(1)
+                    .and_then(|range| config.xover_entries_by_range.get(*range));
+                let entries = if config.xover_entries_by_range.is_empty() {
+                    &config.xover_entries
+                } else {
+                    range_entries.unwrap_or(&config.xover_entries)
+                };
                 if !authenticated {
                     mwrite!(conn, b"480 Authentication required\r\n");
                 } else if selected_group.is_none() {
                     mwrite!(conn, b"412 No newsgroup selected\r\n");
-                } else if config.xover_entries.is_empty() {
+                } else if config.xover_423_outside_group
+                    && xover_range_outside_group(
+                        parts.get(1).copied(),
+                        selected_group
+                            .as_deref()
+                            .and_then(|name| config.groups.get(name)),
+                    )
+                {
+                    mwrite!(conn, b"423 No articles in that range\r\n");
+                } else if entries.is_empty() && config.xover_raw_entries.is_empty() {
                     mwrite!(conn, b"420 No articles in range\r\n");
                 } else {
                     mwrite!(conn, b"224 Overview data follows\r\n");
-                    for entry in &config.xover_entries {
+                    for entry in &config.xover_raw_entries {
+                        mwrite!(conn, entry);
+                        mwrite!(conn, b"\r\n");
+                    }
+                    for entry in entries {
                         mwrite!(conn, entry.as_bytes());
                         mwrite!(conn, b"\r\n");
                     }
                     mwrite!(conn, b".\r\n");
+                }
+            }
+
+            "HEAD" => {
+                if !authenticated {
+                    mwrite!(conn, b"480 Authentication required\r\n");
+                } else if selected_group.is_none() {
+                    mwrite!(conn, b"412 No newsgroup selected\r\n");
+                } else if let Some(article_number) =
+                    parts.get(1).and_then(|value| value.parse().ok())
+                    && let Some(headers) = config.heads.get(&article_number)
+                {
+                    let resp = format!("221 {article_number} article headers follow\r\n");
+                    mwrite!(conn, resp.as_bytes());
+                    mwrite!(conn, headers);
+                    if !headers.ends_with(b"\n") {
+                        mwrite!(conn, b"\r\n");
+                    }
+                    mwrite!(conn, b".\r\n");
+                } else {
+                    mwrite!(conn, b"423 No article with that number\r\n");
                 }
             }
 
@@ -532,13 +605,23 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             }
 
             "XPAT" => {
+                let request_entries = parts
+                    .get(2)
+                    .and_then(|request| config.xpat_entries_by_request.get(*request));
+                let entries = if config.xpat_entries_by_request.is_empty() {
+                    &config.xpat_entries
+                } else {
+                    request_entries.unwrap_or(&config.xpat_entries)
+                };
                 if !authenticated {
                     mwrite!(conn, b"480 Authentication required\r\n");
-                } else if config.xpat_entries.is_empty() {
+                } else if config.xpat_unsupported {
+                    mwrite!(conn, b"500 XPAT unsupported\r\n");
+                } else if entries.is_empty() {
                     mwrite!(conn, b"420 No articles matched\r\n");
                 } else {
                     mwrite!(conn, b"221 Header data follows\r\n");
-                    for entry in &config.xpat_entries {
+                    for entry in entries {
                         mwrite!(conn, entry.as_bytes());
                         mwrite!(conn, b"\r\n");
                     }
@@ -549,6 +632,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             "LIST" => {
                 if !authenticated {
                     mwrite!(conn, b"480 Authentication required\r\n");
+                } else if parts
+                    .get(1)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("OVERVIEW.FMT"))
+                {
+                    mwrite!(conn, b"215 Order of fields in overview database\r\n");
+                    for entry in &config.overview_format_entries {
+                        mwrite!(conn, entry.as_bytes());
+                        mwrite!(conn, b"\r\n");
+                    }
+                    mwrite!(conn, b".\r\n");
                 } else if config.list_active_entries.is_empty() {
                     mwrite!(conn, b"215 List of newsgroups follows\r\n");
                     mwrite!(conn, b".\r\n");
@@ -678,6 +771,21 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
 /// on raw bytes — must NOT lossy-UTF-8-convert because article bodies can be
 /// binary (yEnc-encoded payloads contain non-UTF-8 byte sequences). Accepts
 /// either `\n`- or `\r\n`-delimited input lines and emits canonical `\r\n`.
+/// True when an `XOVER first-last` range lies entirely outside the group's
+/// current `first..=last` article numbers.
+fn xover_range_outside_group(range: Option<&str>, group: Option<&(u64, u64, u64)>) -> bool {
+    let (Some(range), Some(&(_, first, last))) = (range, group) else {
+        return false;
+    };
+    let mut bounds = range.splitn(2, '-');
+    let start = bounds.next().and_then(|v| v.parse::<u64>().ok());
+    let end = bounds.next().and_then(|v| v.parse::<u64>().ok());
+    match (start, end) {
+        (Some(start), Some(end)) => end < first || start > last,
+        _ => false,
+    }
+}
+
 /// Returns `false` if the connection should close (silent_close_after_bytes hit).
 async fn write_multiline_body(conn: &mut ConnState<'_>, data: &[u8]) -> bool {
     let mut start = 0usize;
