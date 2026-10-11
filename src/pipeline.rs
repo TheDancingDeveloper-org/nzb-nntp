@@ -105,13 +105,16 @@ impl Pipeline {
             };
 
             conn.send_command_no_flush(&format!("ARTICLE {mid}"))
-                .await?;
+                .await
+                .inspect_err(|_| conn.state = ConnectionState::Error)?;
             trace!(mid = %mid, tag = req.tag, "Pipeline sent ARTICLE");
             self.in_flight.push_back(req);
             sent += 1;
         }
         if sent > 0 {
-            conn.flush().await?;
+            conn.flush()
+                .await
+                .inspect_err(|_| conn.state = ConnectionState::Error)?;
         }
         Ok(())
     }
@@ -126,7 +129,13 @@ impl Pipeline {
             return Ok(None);
         };
 
-        let status = conn.read_response_line().await?;
+        // Any I/O failure from here on leaves the stream misaligned with the
+        // in-flight queue, so the connection must not be reused (same as
+        // `NntpConnection::fetch_article`).
+        let status = conn
+            .read_response_line()
+            .await
+            .inspect_err(|_| conn.state = ConnectionState::Error)?;
 
         let result = match status.code {
             220 => {
@@ -137,12 +146,15 @@ impl Pipeline {
                         message: status.message,
                         data: Some(data),
                     }),
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        conn.state = ConnectionState::Error;
+                        Err(e)
+                    }
                 }
             }
             430 => Err(NntpError::ArticleNotFound(request.message_id.clone())),
             411 => Err(NntpError::NoSuchGroup(status.message)),
-            412 | 420 => Err(NntpError::NoArticleSelected(status.message)),
+            412 | 420 | 423 => Err(NntpError::NoArticleSelected(status.message)),
             403 => {
                 conn.state = ConnectionState::Error;
                 Err(NntpError::PermissionDenied(status.message))
@@ -297,15 +309,24 @@ impl StatPipeline {
                 } else {
                     format!("<{mid}>")
                 };
+                // An I/O failure anywhere in the batch leaves the stream
+                // misaligned with the outstanding STATs, so the connection
+                // must not be reused.
                 conn.send_command_no_flush(&format!("STAT {normalized}"))
-                    .await?;
+                    .await
+                    .inspect_err(|_| conn.state = ConnectionState::Error)?;
                 trace!(mid = %normalized, "StatPipeline sent STAT");
             }
-            conn.flush().await?;
+            conn.flush()
+                .await
+                .inspect_err(|_| conn.state = ConnectionState::Error)?;
 
             // Read responses in order
             for mid in batch {
-                let resp = conn.read_response_line().await?;
+                let resp = conn
+                    .read_response_line()
+                    .await
+                    .inspect_err(|_| conn.state = ConnectionState::Error)?;
                 match resp.code {
                     223 => {
                         results.push(StatResult {
@@ -335,12 +356,11 @@ impl StatPipeline {
                         return Err(NntpError::ServiceUnavailable(resp.message));
                     }
                     _ => {
-                        // Unknown response — treat as missing but don't abort
-                        trace!(code = resp.code, mid = %mid, "Unexpected STAT response");
-                        results.push(StatResult {
-                            message_id: mid.clone(),
-                            exists: false,
-                        });
+                        conn.state = ConnectionState::Error;
+                        return Err(NntpError::Protocol(format!(
+                            "Unexpected STAT response {}: {}",
+                            resp.code, resp.message
+                        )));
                     }
                 }
             }
@@ -363,6 +383,32 @@ mod tests {
     use super::*;
     use crate::testutil::{MockConfig, MockNntpServer, test_config};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_receive_one_body_failure_marks_connection_error() {
+        // 220 arrives, then the server drops the socket mid-body. The
+        // connection is now misaligned and must not look reusable.
+        let body: Vec<u8> = "line of article data\r\n".repeat(10_000).into_bytes();
+        let mut articles = HashMap::new();
+        articles.insert("cut@test".to_string(), body);
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            // Well past the greeting/CAPABILITIES exchange, well short of
+            // the ~210 KB article.
+            silent_close_after_bytes: Some(50_000),
+            ..Default::default()
+        })
+        .await;
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&test_config(server.port())).await.unwrap();
+
+        let mut pipe = Pipeline::new(1);
+        pipe.submit("cut@test".into(), 0);
+        pipe.flush_sends(&mut conn).await.unwrap();
+        let res = pipe.receive_one(&mut conn).await.unwrap().unwrap();
+        assert!(res.result.is_err(), "body read should fail");
+        assert_eq!(conn.state, ConnectionState::Error);
+    }
 
     #[test]
     fn test_pipeline_submit_and_counts() {
@@ -699,5 +745,51 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].exists);
         assert!(results[1].exists);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_io_failure_marks_connection_error() {
+        // The server answers the connect handshake and the first STAT, then
+        // drops the socket, so a later read in the batch fails mid-stream.
+        let mut articles = HashMap::new();
+        for i in 0..4 {
+            articles.insert(format!("a{i}@test"), b"body".to_vec());
+        }
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            close_after_n_commands: Some(2),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&test_config(server.port())).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        for i in 0..4 {
+            stat.add(format!("a{i}@test"));
+        }
+        assert!(stat.execute(&mut conn).await.is_err());
+        assert_eq!(conn.state, ConnectionState::Error);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_unknown_response_fails_closed() {
+        let mut overrides = HashMap::new();
+        overrides.insert("unknown@test".to_string(), 499);
+        let server = MockNntpServer::start(MockConfig {
+            article_response_overrides: overrides,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        stat.add("unknown@test".into());
+        assert!(matches!(
+            stat.execute(&mut conn).await,
+            Err(NntpError::Protocol(_))
+        ));
     }
 }
