@@ -165,6 +165,11 @@ pub struct MockConfig {
     /// article lookup resumes. This models a stale session returning `400`
     /// followed by a successful fetch on a replacement connection.
     pub article_response_sequences: Option<ArticleResponseSequences>,
+    /// Hold ARTICLE responses for these message-ids until the gate reads
+    /// `true`. One-shot `article_response_sequences` entries are still
+    /// answered at once; only the real response waits. Lets a test order an
+    /// article after others without betting on timing.
+    pub article_holds: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
     /// attempts within the `window`, all subsequent auths return 481.
     pub auth_rate_limit: Option<AuthRateLimit>,
@@ -216,6 +221,7 @@ impl Default for MockConfig {
             response_delay: None,
             article_response_overrides: HashMap::new(),
             article_response_sequences: None,
+            article_holds: HashMap::new(),
             auth_rate_limit: None,
             capabilities_unsupported: false,
             capabilities_mode_reader: false,
@@ -230,6 +236,7 @@ impl Default for MockConfig {
 /// An in-process mock NNTP server for testing.
 pub struct MockNntpServer {
     pub addr: SocketAddr,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
@@ -245,25 +252,37 @@ impl MockNntpServer {
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(config);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        if let Ok((stream, _)) = result {
-                            let cfg = config.clone();
-                            tokio::spawn(handle_connection(stream, cfg));
+        tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                loop {
+                    tokio::select! {
+                        result = listener.accept() => {
+                            if let Ok((stream, _)) = result {
+                                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let cfg = config.clone();
+                                tokio::spawn(handle_connection(stream, cfg));
+                            }
                         }
+                        _ = shutdown_rx.changed() => break,
                     }
-                    _ = shutdown_rx.changed() => break,
                 }
             }
         });
 
         Self {
             addr,
+            accepted,
             _shutdown: shutdown_tx,
         }
+    }
+
+    /// Connections accepted so far. Each one is a fresh connect and login,
+    /// so tests use it to check sockets are reused.
+    pub fn accepted_connections(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The port the mock server is listening on.
@@ -667,6 +686,14 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .article_response_sequences
                         .as_ref()
                         .and_then(|state| state.lock().get_mut(mid).and_then(VecDeque::pop_front));
+                    if sequenced.is_none()
+                        && let Some(gate) = config.article_holds.get(mid)
+                    {
+                        let mut gate = gate.clone();
+                        if gate.wait_for(|open| *open).await.is_err() {
+                            return;
+                        }
+                    }
                     if let Some((code, message)) = sequenced {
                         let resp = format!("{code} {message}\r\n");
                         mwrite!(conn, resp.as_bytes());
