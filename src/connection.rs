@@ -196,6 +196,8 @@ pub enum ConnectionState {
     Busy,
     /// An unrecoverable error occurred; reconnection required.
     Error,
+    /// The server closed an idle connection. A normal disconnect, not a fault.
+    PeerClosed,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +311,7 @@ pub struct NntpConnection {
     /// the data immediately (`fetch_article`, `Pipeline::receive_one`) check
     /// it back in via `release_body_buffer`. This is what actually avoids
     /// the per-article page-fault/allocation cost identified by profiling —
-    /// see `docs/PERFORMANCE_STATUS.md`.
+    /// see `docs/internal/PERFORMANCE_STATUS.md`.
     body_pool: Vec<Vec<u8>>,
     /// Upper bound on each socket write/flush. Always [`WRITE_TIMEOUT`]
     /// outside of tests.
@@ -2257,7 +2259,11 @@ impl NntpConnection {
 
     /// Send QUIT and close the connection gracefully.
     pub async fn quit(&mut self) -> NntpResult<()> {
-        info!(server = %self.server_id, state = ?self.state, "NNTP disconnecting (QUIT)");
+        if self.state == ConnectionState::PeerClosed {
+            debug!(server = %self.server_id, "NNTP disconnecting (QUIT) after server idle close");
+        } else {
+            info!(server = %self.server_id, state = ?self.state, "NNTP disconnecting (QUIT)");
+        }
         if self.transport.is_some() {
             // Best-effort: send QUIT, ignore errors
             if let Err(e) = self.send_command("QUIT").await {
@@ -2523,6 +2529,12 @@ impl NntpConnection {
         }
 
         Ok(())
+    }
+
+    /// Record that the server closed this idle connection, so the disconnect
+    /// that follows is reported as a normal close rather than an error.
+    pub fn mark_peer_closed(&mut self) {
+        self.state = ConnectionState::PeerClosed;
     }
 
     /// Returns `true` if the connection has an active transport.
